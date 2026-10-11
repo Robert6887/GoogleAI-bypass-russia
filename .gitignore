@@ -1,0 +1,137 @@
+# ==============================================================================
+# Git Ignore Rules for ANTIGRAVITY-BYPASS-RUSSIA
+# ==============================================================================
+
+# --- Rust / Cargo ---
+/target/
+/target-*/
+/dist/
+/.agents/
+**/*.rs.bk
+*.pdb
+*.d
+*.rlib
+*.rmeta
+*.o
+*.obj
+*.a
+*.lib
+*.exp
+*.ilk
+*.stackdump
+
+# --- Compiled binaries ---
+*.exe
+*.dll
+*.so
+*.dylib
+*.node
+*.bin
+/antigravity-bypass-russia
+/ag_dns
+
+# --- Archives ---
+*.zip
+*.tar
+*.tar.gz
+*.tar.xz
+*.7z
+*.rar
+
+# --- Backups & temp ---
+*.bak
+*.original
+*.orig
+*.rej
+*.tmp
+*.tmp*
+.tmp_*
+tmp_*
+configs/*.local.json
+upstream.conf
+proxy_rank.conf
+proxy_host_routes.conf
+mode.conf
+iface.conf
+
+# --- Electron / Node leftovers ---
+*.asar
+*.asar.unpacked/
+node_modules/
+
+# --- Logs ---
+*.log
+
+# --- Python (used by the macOS script) ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# --- Secrets ---
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+*.cer
+*.crt
+
+# --- OS ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.AppleDouble
+.LSOverride
+ehthumbs.db
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# --- Editors / AI ---
+.idea/
+.vscode/
+.vs/
+*.code-workspace
+.fleet/
+.zed/
+*.swp
+*.swo
+*.swn
+*~
+*.sublime-project
+*.sublime-workspace
+/.codegraph/
+/.codex/
+.gemini/
+.claude/
+.cursor/
+.copilot/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+.ignore
+
+# Verified local patch state
+*.ag-backups/
+owned_routes.json
+tcp_snapshot.json
+cli_endpoint.json
+
+# Local DNS settings, connection state and legacy network backups
+/network.json
+/network-user.json
+route-health.json
+route-health.lock
+tcp_backup.conf
+doh_backup.conf
+custom_upstream_proxy.conf
+
+# Local project and testing notes
+/PROJECT.md
+/TEST_INFRA.md
+/TEST_READY.md
