@@ -26,6 +26,7 @@ Features:
 
 from __future__ import annotations
 
+import base64
 import concurrent.futures
 import json
 import os
@@ -68,6 +69,17 @@ TARGET_HOSTS = [
     "webchannel-alkalimakersuite-pa.clients6.google.com",
 ]
 
+# Gemini Desktop App & Web domains must NEVER use comss.one (157.22.*) because
+# comss.one triggers 'locationRejected' (iRPC code=9) on robinfrontend-pa and hangs on gemini.google.com.
+GEMINI_STRICT_HOSTS = {
+    "robinfrontend-pa.googleapis.com",
+    "webchannel-robinfrontend-pa.googleapis.com",
+    "proactivebackend-pa.googleapis.com",
+    "geller-pa.googleapis.com",
+    "gemini.google.com",
+    "aicode.googleapis.com",
+}
+
 # Additional suffix domains for /etc/resolver/ split-DNS
 EXTRA_RESOLVER_DOMAINS = [
     "makersuite.google.com",
@@ -107,17 +119,26 @@ UDP_DNS_PROVIDERS = [
     ("geohide.ru", ["37.230.192.51", "45.155.204.190"]),
 ]
 
-SEED_PROXY_IPS = [
-    "191.44.41.79",
-    "157.22.177.90",
-    "157.22.178.170",
+PRIMARY_PROXY_IPS = [
     "193.233.112.67",
     "193.233.112.68",
     "193.233.112.88",
-    "50.7.85.220",
-    "50.7.85.221",
-    "132.243.112.221",
 ]
+
+SECONDARY_PROXY_IPS = [
+    "157.22.177.90",
+    "191.44.41.215",
+    "191.44.41.79",
+]
+
+DISALLOWED_FOR_GEMINI_IPS = {
+    "157.22.177.90",
+    "157.22.178.170",
+    "132.243.112.221",
+    "159.194.200.33",
+}
+
+SEED_PROXY_IPS = PRIMARY_PROXY_IPS + SECONDARY_PROXY_IPS
 
 GOOGLE_FIRST_TWO_OCTETS = {
     (64, 233),
@@ -135,6 +156,7 @@ GOOGLE_FIRST_TWO_OCTETS = {
 }
 
 STATE_DIR = Path("/Library/Application Support/AntigravityBypass")
+LEGACY_RUST_DIR = Path("/Library/Application Support/AntigravityBypassRussia")
 ROUTES_STATE_FILE = STATE_DIR / "owned_routes_macos.json"
 WATCHDOG_PLIST_PATH = Path("/Library/LaunchDaemons/com.antigravity.bypass.watchdog.plist")
 INSTALLED_SCRIPT_PATH = STATE_DIR / "macos-instant-fix.py"
@@ -300,52 +322,43 @@ def query_udp_dns(server_ip: str, domain: str, if_index: int = 0, timeout: float
 
 def query_doh_raw(bootstrap_ip: str, domain: str, if_index: int = 0, timeout: float = 1.8) -> list[str]:
     """
-    Queries https://dns.dns-ai.ru/dns-query directly over a raw socket bound to the physical
-    interface (`en0`), completely ignoring macOS System Proxy and VPN default routes.
+    Queries https://dns.dns-ai.ru/dns-query over RFC 8484 HTTP/2 using /usr/bin/curl.
     """
     pkt = build_dns_query(domain)
-    ctx = ssl.create_default_context()
+    b64 = base64.urlsafe_b64encode(pkt).decode("ascii").rstrip("=")
+    cmd = [
+        "/usr/bin/curl",
+        "-sS",
+        "--http2",
+        "--max-time",
+        str(timeout),
+        "--resolve",
+        f"dns.dns-ai.ru:443:{bootstrap_ip}",
+        "-H",
+        "accept: application/dns-message",
+        f"https://dns.dns-ai.ru/dns-query?dns={b64}",
+    ]
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as raw_sock:
-            bind_socket_to_if(raw_sock, if_index)
-            raw_sock.settimeout(timeout)
-            raw_sock.connect((bootstrap_ip, 443))
-            with ctx.wrap_socket(raw_sock, server_hostname="dns.dns-ai.ru") as tls_sock:
-                tls_sock.settimeout(timeout)
-                req = (
-                    f"POST /dns-query HTTP/1.1\r\n"
-                    f"Host: dns.dns-ai.ru\r\n"
-                    f"Content-Type: application/dns-message\r\n"
-                    f"Accept: application/dns-message\r\n"
-                    f"Content-Length: {len(pkt)}\r\n"
-                    f"Connection: close\r\n\r\n"
-                ).encode("ascii") + pkt
-                tls_sock.sendall(req)
-                resp = b""
-                while len(resp) < 8192:
-                    chunk = tls_sock.recv(4096)
-                    if not chunk:
-                        break
-                    resp += chunk
-                sep = resp.find(b"\r\n\r\n")
-                if sep == -1:
-                    return []
-                header_text = resp[:sep].decode("latin1", errors="ignore")
-                first_line = header_text.splitlines()[0] if header_text else ""
-                if " 200 " not in first_line:
-                    return []
-                body = resp[sep + 4 :]
-                return parse_dns_a_records(body)
+        res = subprocess.run(cmd, capture_output=True, timeout=timeout + 0.5)
+        if res.returncode == 0 and res.stdout:
+            return parse_dns_a_records(res.stdout)
     except Exception:
-        return []
+        pass
+    return []
 
 
 def discover_candidates(domains: list[str], if_index: int = 0) -> dict[str, list[str]]:
-    candidates = {d: list(SEED_PROXY_IPS) for d in domains}
+    candidates: dict[str, list[str]] = {}
+    for d in domains:
+        if d in GEMINI_STRICT_HOSTS:
+            candidates[d] = [ip for ip in SEED_PROXY_IPS if ip not in DISALLOWED_FOR_GEMINI_IPS]
+        else:
+            candidates[d] = list(SEED_PROXY_IPS)
+
     tasks = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=24) as pool:
         for d in domains:
-            for ip in DOH_BOOTSTRAP_IPS[:2]:
+            for ip in DOH_BOOTSTRAP_IPS[:1]:
                 tasks.append((d, "dns-ai.ru", pool.submit(query_doh_raw, ip, d, if_index, 1.8)))
             for prov_name, srv_ips in UDP_DNS_PROVIDERS:
                 for srv_ip in srv_ips:
@@ -353,6 +366,8 @@ def discover_candidates(domains: list[str], if_index: int = 0) -> dict[str, list
         for d, _prov, fut in tasks:
             try:
                 for ip in fut.result():
+                    if d in GEMINI_STRICT_HOSTS and ip in DISALLOWED_FOR_GEMINI_IPS:
+                        continue
                     if ip not in candidates[d]:
                         candidates[d].insert(0, ip)
             except Exception:
@@ -383,6 +398,9 @@ def probe_tls_h2(ip: str, sni_host: str, if_index: int = 0, timeout: float = 2.2
                     if not data.startswith(b"HTTP/1."):
                         return (False, 9999, "invalid_http")
                 ms = max(1, int((time.monotonic() - start) * 1000))
+                # Penalize secondary/slow proxies so PRIMARY_PROXY_IPS (193.233.112.*) always win when healthy
+                if ip not in PRIMARY_PROXY_IPS:
+                    ms += 1500
                 return (True, ms, alpn)
     except Exception as e:
         return (False, 9999, str(e))
@@ -653,6 +671,9 @@ def update_etc_hosts(best_ips: dict[str, str]) -> None:
             continue
         if stripped and not stripped.startswith("#"):
             parts = stripped.split()
+            if len(parts) == 1:
+                # Remove broken single-column IP lines without hostname
+                continue
             if len(parts) >= 2 and any(h in target_set for h in parts[1:]):
                 continue
         kept_lines.append(line)
@@ -738,7 +759,7 @@ def update_user_network_config(if_index: int = 0) -> None:
         ],
         "extra_udp": [],
         "disabled_providers": ["comss.one"],
-        "provider_order": ["dns-ai.ru", "geohide.ru"],
+        "provider_order": ["geohide.ru", "dns-ai.ru"],
         "watch_region_errors": True,
         "log_roots": [
             str(user_home / "Library/Application Support/Antigravity/logs"),
@@ -756,13 +777,14 @@ def update_user_network_config(if_index: int = 0) -> None:
     except Exception:
         pass
 
-    if STATE_DIR.exists():
-        try:
-            (STATE_DIR / "upstream.conf").write_text("37.230.192.51\n45.155.204.190\n", encoding="utf-8")
-            if if_index > 0:
-                (STATE_DIR / "iface.conf").write_text(f"{if_index}\n", encoding="utf-8")
-        except Exception:
-            pass
+    for state_d in [STATE_DIR, LEGACY_RUST_DIR]:
+        if state_d.exists():
+            try:
+                (state_d / "upstream.conf").write_text("37.230.192.51\n45.155.204.190\n", encoding="utf-8")
+                if if_index > 0:
+                    (state_d / "iface.conf").write_text(f"{if_index}\n", encoding="utf-8")
+            except Exception:
+                pass
 
 
 def install_watchdog_daemon() -> bool:
@@ -813,12 +835,13 @@ def install_watchdog_daemon() -> bool:
 def flush_dns_and_restart_relay() -> None:
     subprocess.run(["/usr/bin/dscacheutil", "-flushcache"], check=False)
     subprocess.run(["/usr/bin/killall", "-HUP", "mDNSResponder"], check=False)
-    subprocess.run(
-        ["/bin/launchctl", "kickstart", "-k", "system/com.antigravity.bypass.dns"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
+    for svc in ["system/com.antigravity.bypass.dns", "system/com.antigravity.bypass.russia"]:
+        subprocess.run(
+            ["/bin/launchctl", "kickstart", "-k", svc],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
 
 
 def get_active_utun_list() -> list[str]:
@@ -838,10 +861,15 @@ def run_watchdog_single_pass(force_probe: bool = False, update_sysconfig: bool =
     pinned_ips = list(set(current_pins.values()))
     sync_physical_routes(pinned_ips, gw, update_sysconfig=update_sysconfig)
 
-    if not force_probe and len(current_pins) >= len(TARGET_HOSTS) and gw:
+    has_disallowed_gemini_pin = any(
+        current_pins.get(h) in DISALLOWED_FOR_GEMINI_IPS or current_pins.get(h) == "191.44.41.79"
+        for h in GEMINI_STRICT_HOSTS
+    )
+
+    if not force_probe and not has_disallowed_gemini_pin and len(current_pins) >= len(TARGET_HOSTS) and gw:
         return
 
-    if len(current_pins) >= len(TARGET_HOSTS) and gw:
+    if not has_disallowed_gemini_pin and len(current_pins) >= len(TARGET_HOSTS) and gw:
         canary_hosts = [
             "daily-cloudcode-pa.googleapis.com",
             "aicode.googleapis.com",
@@ -869,7 +897,7 @@ def run_watchdog_single_pass(force_probe: bool = False, update_sysconfig: bool =
         if ranked.get(host):
             best_ips[host] = ranked[host][0][0]
         else:
-            best_ips[host] = "193.233.112.67" if "aicode" in host else "191.44.41.79"
+            best_ips[host] = "193.233.112.67"
 
     update_etc_hosts(best_ips)
     update_etc_resolver()
@@ -1075,7 +1103,7 @@ def main() -> int:
             backup_str = f" [резерв: {backups}]" if backups else ""
             print(f"  {host:<48} | {best_ip:<15} | {best_ms:>5} мс | {alpn}{backup_str}")
         else:
-            fallback_ip = "193.233.112.67" if "aicode" in host else "191.44.41.79"
+            fallback_ip = "193.233.112.67"
             best_ips[host] = fallback_ip
             print(f"  {host:<48} | {fallback_ip:<15} |  резерв  | fallback")
 
