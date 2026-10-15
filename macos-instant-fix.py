@@ -40,7 +40,10 @@ import sys
 import time
 from pathlib import Path
 
+__version__ = "2.4.0"
+
 NRPT_TAG = "ANTIGRAVITY-BYPASS-RUSSIA"
+
 
 # Darwin / macOS kernel constant in <netinet/in.h>: #define IP_BOUND_IF 25
 IP_BOUND_IF = 25
@@ -1062,20 +1065,22 @@ def get_monitored_log_files() -> list[Path]:
                             files.append(f)
                     except Exception:
                         pass
-            ag_logs = user_dir / "Library/Application Support/Antigravity/logs"
+            ag_logs = user_dir / "Library/Logs/Antigravity"
             if ag_logs.is_dir():
-                try:
-                    subdirs = sorted(
-                        [d for d in ag_logs.iterdir() if d.is_dir()],
-                        key=lambda d: d.stat().st_mtime,
-                        reverse=True,
-                    )
-                    for d in subdirs[:1]:
-                        for f in d.rglob("*.log"):
-                            if now - f.stat().st_mtime < 86400:
-                                files.append(f)
-                except Exception:
-                    pass
+                for f in ag_logs.glob("*.log"):
+                    try:
+                        if now - f.stat().st_mtime < 86400:
+                            files.append(f)
+                    except Exception:
+                        pass
+            gemini_cli_log_dir = user_dir / ".gemini/antigravity/log"
+            if gemini_cli_log_dir.is_dir():
+                for f in gemini_cli_log_dir.glob("cli-*.log"):
+                    try:
+                        if now - f.stat().st_mtime < 86400:
+                            files.append(f)
+                    except Exception:
+                        pass
     except Exception:
         pass
     return files
@@ -1084,9 +1089,8 @@ def get_monitored_log_files() -> list[Path]:
 def scan_logs_for_runtime_failures(log_cursors: dict[str, int], init_only: bool = False) -> tuple[bool, str]:
     """
     Closed-loop self-healing log monitor:
-    Reads newly appended bytes in Gemini.app (`diagnostic*.log`) and Antigravity logs.
-    Detects `locationRejected`, `iRPC.Error Code=9`, `User location is not supported`, or
-    repeated `iRPC.Error Code=14` transport failures in real time.
+    Reads newly appended bytes in Gemini.app and Antigravity logs in real time.
+    Detects location restrictions, broken pipes, connection resets, and transport failures.
     """
     triggered = False
     reason = ""
@@ -1110,6 +1114,12 @@ def scan_logs_for_runtime_failures(log_cursors: dict[str, int], init_only: bool 
                 or "User location is not supported" in delta
             ):
                 return True, "locationRejected"
+            if (
+                "broken pipe" in delta
+                or "connection reset by peer" in delta
+                or ("streamGenerateContent" in delta and "request failed" in delta)
+            ):
+                return True, "network_reset_broken_pipe"
             if delta.count("Domain=com.google.iRPC.Error Code=14") >= 2:
                 triggered = True
                 reason = "transport_unavailable_code14"
@@ -1136,7 +1146,7 @@ def run_watchdog_single_pass(force_probe: bool = False, update_sysconfig: bool =
     if not force_probe and not has_quarantined_pin and len(current_pins) >= len(TARGET_HOSTS) and gw:
         return False
 
-    if not has_quarantined_pin and len(current_pins) >= len(TARGET_HOSTS) and gw:
+    if not force_probe and not has_quarantined_pin and len(current_pins) >= len(TARGET_HOSTS) and gw:
         canary_hosts = [
             "daily-cloudcode-pa.googleapis.com",
             "aicode.googleapis.com",
@@ -1149,7 +1159,7 @@ def run_watchdog_single_pass(force_probe: bool = False, update_sysconfig: bool =
                 all_healthy = False
                 break
             ok, ms, _ = probe_tls_h2(ip, h, if_index, timeout=1.5)
-            if not ok or ms > 900:
+            if not ok or ms > 450:
                 all_healthy = False
                 break
             if h == "robinfrontend-pa.googleapis.com":
@@ -1187,16 +1197,17 @@ def run_watchdog_single_pass(force_probe: bool = False, update_sysconfig: bool =
 def run_watchdog_check() -> int:
     """
     Real-time Self-Healing VPN, Route & GeoIP Guardian Daemon:
-    1. Checks every 2 seconds for new/toggled VPN interfaces (`utun*` from Happ, NetBird, FortiVPN)
-       and immediately re-pins `STATIC` (`UGHS`) `/32` routes via the physical router (`en0`).
-    2. Monitors `Gemini.app` and `Antigravity` diagnostic logs in real time for `locationRejected`,
-       `iRPC.Error Code=9` / `Code=14`, or `User location is not supported`. If detected,
-       automatically quarantines the offending IP and switches `/etc/hosts` to a healthy proxy.
-    3. Runs a canary E2E HTTP/2 + Google GeoIP check every 5 minutes.
+    1. Monitors physical gateway (Wi-Fi/Ethernet) changes in real time and re-routes.
+    2. Monitors VPN interfaces (utun* from NetBird, Happ, FortiVPN) and enforces static routes.
+    3. Monitors Antigravity & Gemini logs for broken pipe, connection reset, or location blocks,
+       instantly quarantining bad proxies and failover-switching to healthy ones.
+    4. Periodic re-benchmark every 10 minutes to maintain optimal latency.
     """
     last_utuns: list[str] = []
+    last_gw: str = ""
     last_probe_ts = 0.0
     last_heal_ts = 0.0
+    last_periodic_ts = 0.0
     log_cursors: dict[str, int] = {}
     scan_logs_for_runtime_failures(log_cursors, init_only=True)
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Self-healing Watchdog started.", flush=True)
@@ -1206,15 +1217,25 @@ def run_watchdog_check() -> int:
             now = time.monotonic()
             cur_utuns = get_active_utun_list()
             utun_changed = cur_utuns != last_utuns
-            do_probe = (now - last_probe_ts) >= 300.0 or last_probe_ts == 0.0
+
+            if_name, if_index, cur_gw = detect_physical_egress()
+            gw_changed = bool(cur_gw and last_gw and cur_gw != last_gw)
+            if not last_gw and cur_gw:
+                last_gw = cur_gw
+
+            periodic_check = (now - last_periodic_ts) >= 600.0
 
             log_failed, fail_reason = scan_logs_for_runtime_failures(log_cursors, init_only=False)
-            if log_failed and (now - last_heal_ts) >= 15.0:
+            if log_failed and (now - last_heal_ts) >= 10.0:
                 current_pins = read_current_hosts_pins()
                 suspect_ips = sorted(
                     {
                         current_pins.get(h, "")
-                        for h in ["robinfrontend-pa.googleapis.com", "daily-cloudcode-pa.googleapis.com"]
+                        for h in [
+                            "daily-cloudcode-pa.googleapis.com",
+                            "cloudcode-pa.googleapis.com",
+                            "robinfrontend-pa.googleapis.com",
+                        ]
                         if current_pins.get(h)
                     }
                 )
@@ -1228,6 +1249,8 @@ def run_watchdog_check() -> int:
                 )
                 do_probe = True
                 last_heal_ts = now
+            else:
+                do_probe = (now - last_probe_ts) >= 180.0 or last_probe_ts == 0.0 or gw_changed or periodic_check
 
             if utun_changed:
                 print(
@@ -1237,11 +1260,22 @@ def run_watchdog_check() -> int:
                 last_utuns = cur_utuns
                 time.sleep(0.4)
 
+            if gw_changed:
+                print(
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [NETWORK CHANGE] Gateway changed: {last_gw} -> {cur_gw}. Updating routes and re-ranking proxies...",
+                    flush=True,
+                )
+                last_gw = cur_gw
+                do_probe = True
+
             hosts_changed = run_watchdog_single_pass(
-                force_probe=do_probe, update_sysconfig=utun_changed or do_probe
+                force_probe=do_probe or log_failed,
+                update_sysconfig=utun_changed or gw_changed or do_probe or log_failed,
             )
-            if do_probe:
+            if do_probe or log_failed:
                 last_probe_ts = now
+                if periodic_check or gw_changed:
+                    last_periodic_ts = now
                 scan_logs_for_runtime_failures(log_cursors, init_only=True)
                 if log_failed and hosts_changed:
                     subprocess.run(
@@ -1253,6 +1287,7 @@ def run_watchdog_check() -> int:
             print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Watchdog error: {e}", flush=True)
 
         time.sleep(2.0)
+
 
 
 def run_rollback() -> int:
@@ -1384,7 +1419,7 @@ def main() -> int:
         return run_rollback()
 
     print("\n======================================================================")
-    print("  ANTIGRAVITY + VOICE INPUT + GEMINI DESKTOP (MACOS VPN-IMMUNE FIX)")
+    print(f"  ANTIGRAVITY + VOICE INPUT + GEMINI DESKTOP (MACOS VPN-IMMUNE FIX) v{__version__}")
     print("======================================================================\n")
 
     if_name, if_index, gw = detect_physical_egress()
