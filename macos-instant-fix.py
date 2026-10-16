@@ -85,7 +85,6 @@ GEMINI_STRICT_HOSTS = {
     "proactivebackend-pa.googleapis.com",
     "geller-pa.googleapis.com",
     "gemini.google.com",
-    "aicode.googleapis.com",
 }
 
 # Additional suffix domains for /etc/resolver/ split-DNS
@@ -889,7 +888,10 @@ def update_etc_hosts(best_ips: dict[str, str]) -> None:
                 # Essential for Gemini.app (C++ gRPC c-ares resolver):
                 # c-ares ignores /etc/resolver/ and queries /etc/resolv.conf for AAAA (IPv6)
                 # unless an IPv6 entry exists in /etc/hosts. ::1 stops the IPv6 leak in 0.05ms.
-                kept_lines.append(f"::1 {host} # {NRPT_TAG}")
+                # Do NOT add ::1 for Antigravity domains (daily-cloudcode-pa, etc.) to prevent
+                # Go runtime "dial tcp [::1]:443: connect: connection refused" failure on startup.
+                if host in GEMINI_STRICT_HOSTS:
+                    kept_lines.append(f"::1 {host} # {NRPT_TAG}")
         kept_lines.append(f"# END {NRPT_TAG}")
     kept_lines.append("")
 
