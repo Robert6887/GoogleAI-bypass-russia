@@ -40,7 +40,7 @@ import sys
 import time
 from pathlib import Path
 
-__version__ = "2.4.0"
+__version__ = "2.5.0"
 
 NRPT_TAG = "ANTIGRAVITY-BYPASS-RUSSIA"
 
@@ -1498,19 +1498,9 @@ def main() -> int:
         except Exception:
             pass
 
-    if Path("/Applications/Gemini.app").exists():
-        subprocess.run(["/usr/bin/killall", "Gemini"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(0.5)
-        if sudo_user and sudo_user != "root":
-            subprocess.run(
-                ["/usr/bin/su", "-", sudo_user, "-c", "open -a /Applications/Gemini.app"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-
     if wd_ok:
         print("      - Служба com.antigravity.bypass.watchdog (реакция < 2 сек на включение VPN) активна!")
-        print("      - Приложение Gemini.app автоматически перезапущено через новый IPv4 маршрут.")
+        print("      - Маршруты и DNS для Antigravity, Голосового ввода и Gemini.app применены.")
 
     print("\n[ГОТОВО] Antigravity, Голосовой ввод и Gemini.app настроены и изолированы от VPN!\n")
     return 0

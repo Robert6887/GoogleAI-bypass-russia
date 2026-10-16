@@ -104,6 +104,6 @@ jobs:
             dist/unlock_and_restore.ps1
             dist/unlock_and_restore.sh
           body_path: docs/releases/${{ github.ref_name }}.md
-          draft: true
+          draft: false
           generate_release_notes: false
           append_body: false
