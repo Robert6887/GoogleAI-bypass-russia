@@ -83,8 +83,6 @@ GEMINI_STRICT_HOSTS = {
     "robinfrontend-pa.googleapis.com",
     "webchannel-robinfrontend-pa.googleapis.com",
     "proactivebackend-pa.googleapis.com",
-    "geller-pa.googleapis.com",
-    "gemini.google.com",
 }
 
 # Additional suffix domains for /etc/resolver/ split-DNS
@@ -585,12 +583,18 @@ def rank_all_hosts(
             country = geo_map.get(ip, "")
             prefix16 = ".".join(ip.split(".")[:2])
             penalty = 0
+            if country == "US":
+                penalty -= 400
+            elif country in ("NL", "DE"):
+                penalty -= 100
             if not country or country in GEO_BLOCKED_COUNTRIES:
                 penalty += 800
             if prefix16 in contaminated_prefixes:
                 penalty += 1200
             if universal_ips and ip not in universal_ips:
                 penalty += 1200
+            if ip == "143.20.64.55":
+                penalty += 1500  # Unstable proxy (recurrent broken pipe and locationRejected)
             label = f"{alpn} [GEO:{country}]" if country else alpn
             results[host].append((ip, ms + penalty, label))
         results[host].sort(key=lambda item: item[1])
@@ -1146,13 +1150,12 @@ def run_watchdog_single_pass(force_probe: bool = False, update_sysconfig: bool =
     )
 
     if not force_probe and not has_quarantined_pin and len(current_pins) >= len(TARGET_HOSTS) and gw:
-        return False
-
-    if not force_probe and not has_quarantined_pin and len(current_pins) >= len(TARGET_HOSTS) and gw:
         canary_hosts = [
             "daily-cloudcode-pa.googleapis.com",
-            "aicode.googleapis.com",
             "robinfrontend-pa.googleapis.com",
+            "gemini.google.com",
+            "webchannel-alkalimakersuite-pa.clients6.google.com",
+            "aicode.googleapis.com",
         ]
         all_healthy = True
         for h in canary_hosts:
@@ -1160,13 +1163,30 @@ def run_watchdog_single_pass(force_probe: bool = False, update_sysconfig: bool =
             if not ip:
                 all_healthy = False
                 break
-            ok, ms, _ = probe_tls_h2(ip, h, if_index, timeout=1.5)
-            if not ok or ms > 450:
+            ok, ms, _ = probe_tls_h2(ip, h, if_index, timeout=1.8)
+            if not ok:
+                print(
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [HEALTHCHECK FAIL] Host '{h}' unreachable on IP {ip}! Quarantining...",
+                    flush=True,
+                )
+                quarantine_ip(ip, ttl_sec=1800, reason=f"canary_fail_{h}")
                 all_healthy = False
                 break
-            if h == "robinfrontend-pa.googleapis.com":
+            if ms > 900:
+                print(
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [CANARY DEGRADED] IP {ip} latency {ms}ms > 900ms. Quarantining...",
+                    flush=True,
+                )
+                quarantine_ip(ip, ttl_sec=900, reason=f"canary_slow_{ms}ms")
+                all_healthy = False
+                break
+            if h in ("robinfrontend-pa.googleapis.com", "gemini.google.com"):
                 country = check_google_geo_ip(ip, if_index, timeout=2.0)
                 if country in GEO_BLOCKED_COUNTRIES:
+                    print(
+                        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [CANARY GEO-BLOCK] IP {ip} geo-detected as {country}. Quarantining...",
+                        flush=True,
+                    )
                     quarantine_ip(ip, ttl_sec=7200, reason=f"canary_geo_{country}", country=country)
                     all_healthy = False
                     break
@@ -1209,6 +1229,7 @@ def run_watchdog_check() -> int:
     last_gw: str = ""
     last_probe_ts = 0.0
     last_heal_ts = 0.0
+    last_canary_ts = 0.0
     last_periodic_ts = 0.0
     log_cursors: dict[str, int] = {}
     scan_logs_for_runtime_failures(log_cursors, init_only=True)
@@ -1270,15 +1291,19 @@ def run_watchdog_check() -> int:
                 last_gw = cur_gw
                 do_probe = True
 
-            hosts_changed = run_watchdog_single_pass(
-                force_probe=do_probe or log_failed,
-                update_sysconfig=utun_changed or gw_changed or do_probe or log_failed,
-            )
-            if do_probe or log_failed:
-                last_probe_ts = now
-                if periodic_check or gw_changed:
-                    last_periodic_ts = now
-                scan_logs_for_runtime_failures(log_cursors, init_only=True)
+            canary_due = (now - last_canary_ts) >= 25.0
+
+            if canary_due or do_probe or log_failed or utun_changed or gw_changed:
+                hosts_changed = run_watchdog_single_pass(
+                    force_probe=do_probe or log_failed,
+                    update_sysconfig=utun_changed or gw_changed or do_probe or log_failed,
+                )
+                last_canary_ts = now
+                if do_probe or log_failed:
+                    last_probe_ts = now
+                    if periodic_check or gw_changed:
+                        last_periodic_ts = now
+                    scan_logs_for_runtime_failures(log_cursors, init_only=True)
                 if log_failed and hosts_changed:
                     subprocess.run(
                         ["/usr/bin/killall", "Gemini"],
