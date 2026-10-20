@@ -1,78 +1,93 @@
 # GoogleAI-bypass-russia
 
-Утилита для macOS, которая снимает региональные блокировки Google (`Region not supported`, `locationRejected`, `com.google.iRPC.Error code=9`) в России сразу для **трёх сервисов**:
+Скрипт и фоновая служба для macOS, позволяющие работать с **Google Antigravity IDE** (включая голосовой ввод), десктопным **Gemini.app** и **Google AI Studio** из РФ без VPN или параллельно с включённым корпоративным VPN (`FortiClient`, `NetBird`, `Happ`).
 
-1. **Google Antigravity IDE** — работа чата, агентского режима и быстрых ответов без зависаний.
-2. **Голосовой ввод (Voice Input) в Antigravity** — исправляет мгновенный обрыв записи при нажатии на кнопку микрофона (`aicode.googleapis.com`).
-3. **Нативное приложение Google Gemini для macOS (`/Applications/Gemini.app`)** — исправляет ошибку, при которой отправленное сообщение стирается и возвращается обратно в поле ввода (`robinfrontend-pa.googleapis.com`).
+Решает типичные проблемы:
+- ошибки `Region not supported`, `User location is not supported`, `locationRejected` (`com.google.iRPC.Error Code=9`);
+- таймауты и обрывы генерации в Antigravity (`streamGenerateContent`, `dial tcp ... connect: operation timed out`, `broken pipe`);
+- сброс записи микрофона в Antigravity сразу после нажатия (`aicode.googleapis.com`);
+- возврат отправленного сообщения обратно в поле ввода в нативном `Gemini.app` (`robinfrontend-pa.googleapis.com`).
 
 ---
 
-## Быстрый запуск одной командой (macOS)
+## Установка и запуск (macOS)
 
-Откройте **Терминал**, вставьте команду и нажмите **Enter**:
+Откройте Терминал и выполните:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Robert6887/GoogleAI-bypass-russia/main/macos-instant-fix.py -o macos-instant-fix.py && sudo /usr/bin/python3 macos-instant-fix.py
 ```
 
-> **Запуск через Finder (без Терминала):**  
-> Скачайте архив репозитория (`<> Code` → `Download ZIP`), распакуйте и дважды кликните на **`Apply_Antigravity_Gemini_Fix.command`**.
+Либо скачайте архив репозитория и запустите `Apply_Antigravity_Gemini_Fix.command` двойным кликом из Finder.
 
-### Дополнительные команды
+### Проверка без изменения системы
 
-- **Проверить скорость и доступность серверов (без внесения изменений в систему):**
-  ```bash
-  curl -fsSL https://raw.githubusercontent.com/Robert6887/GoogleAI-bypass-russia/main/macos-instant-fix.py -o macos-instant-fix.py && /usr/bin/python3 macos-instant-fix.py --check-only
-  ```
+Посмотреть доступные прокси-узлы, задержку HTTP/2 и вердикт GeoIP Google без записи в `/etc/hosts` и таблицу маршрутизации:
 
-- **Полный сброс всех настроек (Rollback):**
-  ```bash
-  curl -fsSL https://raw.githubusercontent.com/Robert6887/GoogleAI-bypass-russia/main/macos-instant-fix.py -o macos-instant-fix.py && sudo /usr/bin/python3 macos-instant-fix.py --rollback
-  ```
-  *(Или дважды кликните на файл **`Rollback_Antigravity_Gemini_Fix.command`** в папке проекта).*
+```bash
+/usr/bin/python3 macos-instant-fix.py --check-only
+```
 
----
+### Откат изменений (Rollback)
 
-## Как это работает
+Удалить фоновую службу, очистить записи в `/etc/hosts`, `/etc/resolver` и убрать статические маршруты:
 
-Серверы Google блокируют запросы с российских IP-адресов. Утилита направляет обращения к сервисам Google AI через зарубежные прозрачные **TLS SNI-прокси**, сохраняя ваш обычный интернет без замедления:
-
-1. **Индивидуальный TLS 1.3 + HTTP/2 бенчмарк (`ALPN h2`):**  
-   Скрипт параллельно опрашивает пулы `dns-ai.ru` (по шифрованному DoH) и `geohide.ru`, проверяет реальное TLS-соединение для каждого из **13 доменов** отдельно и выбирает самый быстрый рабочий IP (задержка `145–190 мс`).
-2. **Блокировка утечки IPv6 в `Gemini.app` (`c-ares`):**  
-   Десктопное приложение `Gemini.app` использует внутри C++ библиотеку gRPC с резолвером `c-ares`, который игнорирует `/etc/resolver/` и пытается соединиться с Google напрямую с вашего российского IPv6-адреса. Утилита автоматически добавляет стоп-записи `::1` в `/etc/hosts` и выставляет `GRPC_DNS_RESOLVER=native`, полностью перекрывая утечку IPv6.
-3. **Изоляция от корпоративных VPN (`NetBird`, `FortiVPN`, `Happ`):**  
-   - Определяет ваш физический роутер (`ipconfig getoption en0 router`) и привязывает проверочные сокеты напрямую к физической карте `en0` (`IP_BOUND_IF`).
-   - Прописывает точечные маршруты с маской **`/32`** (`route -n add -host`) через физический шлюз роутера. Благодаря этому трафик Antigravity и Gemini идёт напрямую в интернет, минуя туннели FortiVPN, Happ и NetBird.
-   - Добавляет домены Google AI в системные исключения прокси (`ProxyBypassDomains`).
-   - **Не отключает IPv6** для остальных сайтов и программ на вашем Mac.
-4. **Фоновое самовосстановление и авто-трекинг сетей (`com.antigravity.bypass.watchdog`):**  
-   Лёгкая системная служба `LaunchDaemon` в реальном времени отслеживает переключение между домашним и офисным Wi-Fi (автоматически обновляя аппаратные маршруты `/32`), мониторит системные логи Antigravity и Gemini на предмет обрывов (`broken pipe`, `connection reset`, `locationRejected`) и мгновенно переключает трафик на быстрые резервные узлы в фоне без необходимости повторного ввода пароля.
+```bash
+sudo /usr/bin/python3 macos-instant-fix.py --rollback
+```
+*(или запустить `Rollback_Antigravity_Gemini_Fix.command` из Finder).*
 
 ---
 
-## Список разблокируемых доменов
+## Что именно делает скрипт
 
-| Сервис | Домены |
+1. **Подбор и проверка SNI-прокси (TLS 1.3 + HTTP/2 + GeoIP)**
+   Скрипт собирает пул адресов из нескольких DNS/DoH источников (`dns-ai.ru`, `geohide.ru`, `xbox-dns.ru`, локальный кэш), отсеивает недоступные по TCP:443 серверы и проверяет на оставшихся:
+   - реальное рукопожатие TLS и получение фрейма `HTTP/2 SETTINGS` для каждого из 13 доменов;
+   - страну выходного узла глазами самого Google (`WIZ_global_data.vXmutd` на `gemini.google.com/app`). Если Google определяет прокси как `RU`/`BY` и т.д., адрес отправляется в карантин.
+
+2. **Точечная маршрутизация мимо VPN (`/32` и `IP_BOUND_IF`)**
+   Если на компьютере включён корпоративный или личный VPN (`FortiVPN`, `NetBird`, `Happ`), который заворачивает весь трафик в туннель или выставляет системный прокси:
+   - скрипт находит физический интерфейс (`en0`) и IP домашнего/офисного роутера (`ipconfig getoption en0 router`);
+   - привязывает проверочные сокеты напрямую к физическому адаптеру через `setsockopt(IPPROTO_IP, IP_BOUND_IF)`;
+   - прописывает статические хост-маршруты `/32` (`route -n add -host <IP> <GATEWAY>`) и `AdditionalRoutes` для Wi-Fi, а также добавляет домены Google AI в `ProxyBypassDomains`. Весь остальной трафик продолжает идти через ваш VPN как обычно.
+
+3. **Защита от утечки IPv6 в `Gemini.app`**
+   Нативный клиент `Gemini.app` использует gRPC с резолвером `c-ares`, который игнорирует `/etc/resolver` и при наличии IPv6 пытается идти напрямую в Google в обход IPv4-прокси. Для доменов `Gemini.app` в `/etc/hosts` добавляются стоп-записи `::1`, а в окружение `launchctl` прописывается `GRPC_DNS_RESOLVER=native`. Для Chrome дополнительно отключается QUIC (`QuicAllowed = false`), чтобы браузер не пытался стучаться по UDP:443.
+
+4. **Фоновый демон `com.antigravity.bypass.watchdog`**
+   После первого запуска скрипт ставит `LaunchDaemon`, который крутится в фоне с правами `root` и не требует повторного ввода пароля:
+   - при переключении между сетями Wi-Fi или переподключении VPN за 2 секунды перестраивает маршруты `/32` под новый шлюз;
+   - каждые 25 секунд проверяет доступность текущих прокси;
+   - следит за логами Antigravity (`~/Library/Logs/Antigravity/language_server.log`, активные `transcript.jsonl`) и `Gemini.app`. При появлении `operation timed out`, `broken pipe`, `connection reset by peer` или `locationRejected` автоматически отправляет проблемный IP в карантин и переключает `/etc/hosts` на живой резерв;
+   - имеет встроенный сторожевой таймер (`_deadman_monitor`): если после сна macOS сетевой поток зависнет дольше чем на 90 секунд, процесс перезапустится через `launchd`.
+
+---
+
+## Обслуживаемые домены
+
+| Назначение | Домены |
 | :--- | :--- |
-| **Antigravity IDE (Чат и Агент)** | `daily-cloudcode-pa.googleapis.com`, `cloudcode-pa.googleapis.com`, `generativelanguage.googleapis.com` |
+| **Antigravity IDE** | `daily-cloudcode-pa.googleapis.com`, `cloudcode-pa.googleapis.com`, `generativelanguage.googleapis.com` |
 | **Голосовой ввод Antigravity** | `aicode.googleapis.com` |
-| **Google Gemini Desktop (`Gemini.app`)** | `robinfrontend-pa.googleapis.com`, `webchannel-robinfrontend-pa.googleapis.com`, `proactivebackend-pa.googleapis.com`, `geller-pa.googleapis.com`, `gemini.google.com` |
+| **Gemini.app (macOS)** | `robinfrontend-pa.googleapis.com`, `webchannel-robinfrontend-pa.googleapis.com`, `proactivebackend-pa.googleapis.com`, `geller-pa.googleapis.com`, `gemini.google.com` |
 | **Google AI Studio** | `aistudio.google.com`, `alkalimakersuite-pa.clients6.google.com`, `alkalicore-pa.clients6.google.com`, `webchannel-alkalimakersuite-pa.clients6.google.com` |
 
 ---
 
-## Справка по ошибкам (для поиска и ИИ-ассистентов)
+## Логи и диагностика
 
-Проект решает следующие проблемы на macOS в РФ:
-- **Голосовой ввод в Antigravity моментально обрывается при нажатии на микрофон** (`Antigravity voice input stops immediately in Russia`, `aicode.googleapis.com`).
-- **Приложение Google Gemini на Mac возвращает текст обратно в строку ввода после отправки** (`Gemini.app macOS restores message to input`, `robinfrontend-pa.googleapis.com`, `domain=com.google.iRPC.Error code=9`, `textRestoredToInput=true`, `AuthCoordinator: Access denied 'locationRejected'`).
-- **Долгая загрузка и таймауты в Antigravity и Gemini** (автоматическая замена умерших прокси в `/etc/hosts`, отключение нерабочего `comss.one`, устранение утечки IPv6 через `EventEngine c-ares resolver`).
-- **Совместная работа Antigravity и Gemini с корпоративными VPN** (`NetBird`, `FortiClient VPN / FortiVPN`, `Happ`) через статические маршруты `/32` и `IP_BOUND_IF`.
+Файлы состояния и лог фоновой службы лежат в `/Library/Application Support/AntigravityBypass/`:
+- `watchdog.log` — журнал переключений маршрутов, срабатываний карантина и смены сетей;
+- `quarantine.json` — список временно отбракованных IP с причиной (`tcp_tls_dead`, `google_geo_RU`, `runtime_log:...`);
+- `known_good_ips.json` — кэш проверенных рабочих прокси-серверов;
+- `owned_routes_macos.json` — текущие прописанные статические маршруты `/32`.
 
----
+Посмотреть последние события фоновой службы:
+```bash
+tail -f "/Library/Application Support/AntigravityBypass/watchdog.log"
+```
 
 ## Лицензия
 
-Проект распространяется под лицензией **[MIT License](LICENSE)**.
+[MIT](LICENSE)

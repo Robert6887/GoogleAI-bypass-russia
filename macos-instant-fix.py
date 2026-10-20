@@ -37,10 +37,11 @@ import ssl
 import struct
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
-__version__ = "2.5.0"
+__version__ = "2.6.0"
 
 NRPT_TAG = "ANTIGRAVITY-BYPASS-RUSSIA"
 
@@ -396,32 +397,45 @@ def load_known_good_ips() -> list[str]:
     return []
 
 
-def save_known_good_ips(new_ips: list[str]) -> None:
+def save_known_good_ips(new_ips: list[str], dead_ips: set[str] | None = None) -> None:
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
+        dead = dead_ips or set()
+        quarantined = load_quarantine()
         existing = load_known_good_ips()
         merged = []
         for ip in new_ips + existing:
-            if ip and ip not in merged and not looks_like_google(ip):
+            if (
+                ip
+                and ip not in merged
+                and ip not in dead
+                and ip not in quarantined
+                and not looks_like_google(ip)
+            ):
                 merged.append(ip)
         KNOWN_GOOD_FILE.write_text(json.dumps(merged[:32], indent=2), encoding="utf-8")
     except Exception:
         pass
 
 
-def check_google_geo_ip(ip: str, if_index: int = 0, timeout: float = 2.2) -> str:
+def check_google_geo_ip(ip: str, if_index: int = 0, timeout: float = 2.0) -> tuple[bool, str]:
     """
-    Proactively queries Google's own WIZ_global_data (`vXmutd`) on `gemini.google.com/app`
-    through candidate SNI proxy `ip` to determine what 2-letter ISO country Google assigns
-    to that proxy's egress IP (e.g. 'US', 'NL', 'DE' vs 'RU').
+    Single-pass unique-IP liveness + GeoIP check:
+    1. Verifies that TCP:443 + TLS handshake is actually reachable on `ip` (eliminating dead IPs in 1.8s
+       instead of probing each dead IP 13 hosts x 2 retries = 26 times).
+    2. Queries Google's WIZ_global_data (`vXmutd`) on `gemini.google.com/app` to determine the 2-letter
+       ISO country Google assigns to that proxy's egress IP (e.g. 'US', 'NL', 'DE' vs 'RU').
+    Returns (tcp_alive, iso_country).
     """
     ctx = ssl.create_default_context()
+    tcp_alive = False
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as raw_sock:
             bind_socket_to_if(raw_sock, if_index)
             raw_sock.settimeout(timeout)
             raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             raw_sock.connect((ip, 443))
+            tcp_alive = True
             with ctx.wrap_socket(raw_sock, server_hostname="gemini.google.com") as tls_sock:
                 req = (
                     b"GET /app HTTP/1.1\r\n"
@@ -431,7 +445,8 @@ def check_google_geo_ip(ip: str, if_index: int = 0, timeout: float = 2.2) -> str
                 )
                 tls_sock.sendall(req)
                 buf = bytearray()
-                while len(buf) < 220000:
+                deadline = time.monotonic() + timeout + 0.6
+                while len(buf) < 220000 and time.monotonic() < deadline:
                     chunk = tls_sock.recv(16384)
                     if not chunk:
                         break
@@ -446,59 +461,97 @@ def check_google_geo_ip(ip: str, if_index: int = 0, timeout: float = 2.2) -> str
                         break
                 m = re.search(rb'"vXmutd":"%\.@\.\\"([A-Z]{2})\\"', bytes(buf))
                 if m:
-                    return m.group(1).decode("ascii")
+                    return True, m.group(1).decode("ascii")
     except Exception:
         pass
-    return ""
+    if not tcp_alive:
+        # Second quick TCP check on daily-cloudcode-pa SNI in case proxy only serves CloudCode
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as raw_sock:
+                bind_socket_to_if(raw_sock, if_index)
+                raw_sock.settimeout(1.2)
+                raw_sock.connect((ip, 443))
+                tcp_alive = True
+        except Exception:
+            pass
+    return tcp_alive, ""
 
 
-def audit_proxy_geo_countries(ips: list[str], if_index: int = 0) -> dict[str, str]:
+def audit_proxy_geo_countries(ips: list[str], if_index: int = 0) -> tuple[dict[str, str], set[str]]:
     """
-    Audits all unique candidate IPs in parallel against Google's GeoIP database.
-    Any IP whose egress Google classifies in GEO_BLOCKED_COUNTRIES (e.g. 'RU') is
-    automatically quarantined so it never triggers `locationRejected` (iRPC code=9).
+    Audits all unique candidate IPs in parallel:
+    - Filters out TCP-dead IPs in one pass (~2s) so they never clog the per-host H2 benchmark.
+    - Quarantines any IP whose egress Google classifies in GEO_BLOCKED_COUNTRIES (e.g. 'RU').
+    Returns (geo_map, alive_unique_ips).
     """
     geo_map: dict[str, str] = {}
+    alive_ips: set[str] = set()
     unique_ips = sorted(set(ips))
     if not unique_ips:
-        return geo_map
-    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
-        futs = {pool.submit(check_google_geo_ip, ip, if_index, 2.2): ip for ip in unique_ips}
-        for fut, ip in futs.items():
+        return geo_map, alive_ips
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=24)
+    try:
+        futs = {pool.submit(check_google_geo_ip, ip, if_index, 2.0): ip for ip in unique_ips}
+        done, _ = concurrent.futures.wait(futs.keys(), timeout=4.5)
+        for fut in done:
+            ip = futs[fut]
             try:
-                country = fut.result()
+                tcp_alive, country = fut.result(timeout=0.1)
+                if tcp_alive:
+                    alive_ips.add(ip)
                 if country:
                     geo_map[ip] = country
                     if country in GEO_BLOCKED_COUNTRIES:
                         quarantine_ip(ip, ttl_sec=7200, reason=f"google_geo_{country}", country=country)
             except Exception:
                 pass
-    return geo_map
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return geo_map, alive_ips
 
 
 def discover_candidates(domains: list[str], if_index: int = 0) -> dict[str, list[str]]:
-    known_good = load_known_good_ips()
+    quarantined = load_quarantine()
+    known_good = [ip for ip in load_known_good_ips() if ip not in quarantined]
     base_pool = []
-    for ip in known_good + SEED_PROXY_IPS:
+    for ip in known_good + [x for x in SEED_PROXY_IPS if x not in quarantined]:
         if ip not in base_pool:
             base_pool.append(ip)
 
     candidates: dict[str, list[str]] = {d: list(base_pool) for d in domains}
+    global_discovered: list[str] = []
     tasks = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=32)
+    try:
         for d in domains:
-            for ip in DOH_BOOTSTRAP_IPS[:2]:
-                tasks.append((d, "dns-ai.ru", pool.submit(query_doh_raw, ip, d, if_index, 1.8)))
+            tasks.append((d, "dns-ai.ru", pool.submit(query_doh_raw, DOH_BOOTSTRAP_IPS[0], d, if_index, 1.6)))
             for prov_name, srv_ips in UDP_DNS_PROVIDERS:
                 for srv_ip in srv_ips:
-                    tasks.append((d, prov_name, pool.submit(query_udp_dns, srv_ip, d, if_index, 1.2)))
+                    tasks.append((d, prov_name, pool.submit(query_udp_dns, srv_ip, d, if_index, 1.0)))
+        all_futs = [fut for _, _, fut in tasks]
+        concurrent.futures.wait(all_futs, timeout=3.0)
         for d, _prov, fut in tasks:
+            if not fut.done():
+                continue
             try:
-                for ip in fut.result():
+                for ip in fut.result(timeout=0.05):
+                    if ip in quarantined:
+                        continue
                     if ip not in candidates[d]:
                         candidates[d].insert(0, ip)
+                    if ip not in global_discovered:
+                        global_discovered.append(ip)
             except Exception:
                 pass
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    # Share any newly discovered SNI proxy across all target domains so a working node
+    # found on one domain (e.g. gemini.google.com) can also rescue daily-cloudcode-pa
+    for d in domains:
+        for ip in global_discovered:
+            if ip not in candidates[d]:
+                candidates[d].append(ip)
     return candidates
 
 
@@ -546,31 +599,61 @@ def rank_all_hosts(
     candidates_by_host: dict[str, list[str]], if_index: int = 0
 ) -> tuple[dict[str, list[tuple[str, int, str]]], dict[str, str], dict[str, dict]]:
     all_unique_ips = sorted({ip for ips in candidates_by_host.values() for ip in ips})
-    geo_map = audit_proxy_geo_countries(all_unique_ips, if_index)
+    geo_map, pre_alive_ips = audit_proxy_geo_countries(all_unique_ips, if_index)
     quarantined = load_quarantine()
     for ip, country in geo_map.items():
         if country in GEO_BLOCKED_COUNTRIES and ip not in quarantined:
             quarantined[ip] = {"reason": f"google_geo_{country}", "country": country}
 
-    # Subnets (/16) that contain at least one geo-blocked or quarantined IP
-    contaminated_prefixes = {".".join(ip.split(".")[:2]) for ip in quarantined if "." in ip}
+    # Subnets (/16) that contain at least one geo-blocked IP (e.g. Russian datacenter /16)
+    contaminated_prefixes = {
+        ".".join(ip.split(".")[:2])
+        for ip, meta in quarantined.items()
+        if "." in ip
+        and (
+            meta.get("country") in GEO_BLOCKED_COUNTRIES
+            or "geo" in str(meta.get("reason", ""))
+            or "location" in str(meta.get("reason", ""))
+        )
+    }
 
     raw_probes: dict[str, list[tuple[str, int, str]]] = {h: [] for h in candidates_by_host}
+    probed_ips: set[str] = {ip for ip in all_unique_ips if ip not in quarantined}
+    alive_ips: set[str] = set()
     futures = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=24)
+    try:
         for host, ips in candidates_by_host.items():
             for ip in ips:
                 if ip in quarantined:
+                    continue
+                if pre_alive_ips and ip not in pre_alive_ips:
                     continue
                 country = geo_map.get(ip, "")
                 if country in GEO_BLOCKED_COUNTRIES:
                     continue
                 fut = pool.submit(probe_tls_h2, ip, host, if_index, 2.2)
                 futures[fut] = (host, ip)
-        for fut, (host, ip) in futures.items():
-            ok, ms, alpn = fut.result()
-            if ok:
-                raw_probes[host].append((ip, ms, alpn))
+        done, _ = concurrent.futures.wait(futures.keys(), timeout=12.0)
+        for fut in done:
+            host, ip = futures[fut]
+            try:
+                ok, ms, alpn = fut.result(timeout=0.1)
+                if ok:
+                    raw_probes[host].append((ip, ms, alpn))
+                    alive_ips.add(ip)
+            except Exception:
+                pass
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    # Automatically quarantine and evict completely unresponsive TCP/TLS proxy nodes
+    # (only if at least one proxy succeeded, so offline Wi-Fi does not quarantine everything)
+    dead_ips = probed_ips - alive_ips
+    if alive_ips and dead_ips:
+        for dead_ip in sorted(dead_ips):
+            quarantine_ip(dead_ip, ttl_sec=900, reason="tcp_tls_dead")
+            quarantined[dead_ip] = {"reason": "tcp_tls_dead", "country": geo_map.get(dead_ip, "")}
 
     # Universal proxies support both Antigravity Core (daily-cloudcode-pa) and Gemini App (robinfrontend-pa)
     core_ok_ips = {ip for ip, _, _ in raw_probes.get("daily-cloudcode-pa.googleapis.com", [])}
@@ -583,18 +666,18 @@ def rank_all_hosts(
             country = geo_map.get(ip, "")
             prefix16 = ".".join(ip.split(".")[:2])
             penalty = 0
-            if country == "US":
-                penalty -= 400
-            elif country in ("NL", "DE"):
-                penalty -= 100
+            if country in ("US", "NL", "DE", "FI", "SE", "FR", "GB"):
+                penalty -= 300
             if not country or country in GEO_BLOCKED_COUNTRIES:
                 penalty += 800
             if prefix16 in contaminated_prefixes:
                 penalty += 1200
-            if universal_ips and ip not in universal_ips:
+            if (
+                universal_ips
+                and ip not in universal_ips
+                and host in ("daily-cloudcode-pa.googleapis.com", "robinfrontend-pa.googleapis.com")
+            ):
                 penalty += 1200
-            if ip == "143.20.64.55":
-                penalty += 1500  # Unstable proxy (recurrent broken pipe and locationRejected)
             label = f"{alpn} [GEO:{country}]" if country else alpn
             results[host].append((ip, ms + penalty, label))
         results[host].sort(key=lambda item: item[1])
@@ -618,8 +701,8 @@ def rank_all_hosts(
             ):
                 verified_good.append(top_ip)
 
-    if verified_good:
-        save_known_good_ips(verified_good)
+    if verified_good or dead_ips:
+        save_known_good_ips(verified_good, dead_ips=dead_ips if alive_ips else None)
 
     return results, geo_map, quarantined
 
@@ -738,11 +821,15 @@ def sync_physical_routes(proxy_ips: list[str], gateway: str | None, update_sysco
         for entry in old_routes:
             old_ip = entry.get("ip")
             if old_ip:
-                subprocess.run(
-                    ["/sbin/route", "-n", "delete", "-host", old_ip],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+                try:
+                    subprocess.run(
+                        ["/sbin/route", "-n", "delete", "-host", old_ip],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=2,
+                    )
+                except Exception:
+                    pass
         return 0
 
     all_ips = sorted(
@@ -759,11 +846,15 @@ def sync_physical_routes(proxy_ips: list[str], gateway: str | None, update_sysco
         old_ip = entry.get("ip")
         old_gw = entry.get("gateway")
         if old_ip and (old_ip not in all_ips or old_gw != gateway):
-            subprocess.run(
-                ["/sbin/route", "-n", "delete", "-host", old_ip],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            try:
+                subprocess.run(
+                    ["/sbin/route", "-n", "delete", "-host", old_ip],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                )
+            except Exception:
+                pass
 
     current_static = get_static_host_routes()
     applied = 0
@@ -775,25 +866,31 @@ def sync_physical_routes(proxy_ips: list[str], gateway: str | None, update_sysco
             continue
 
         # Delete any WASCLONED (`W`) or VPN-hijacked route first so `add` creates a permanent STATIC (`UGHS`) route
-        subprocess.run(
-            ["/sbin/route", "-n", "delete", "-host", ip],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        res = subprocess.run(
-            ["/sbin/route", "-n", "add", "-host", ip, gateway],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        if res.returncode != 0:
-            res = subprocess.run(
-                ["/sbin/route", "-n", "change", "-host", ip, gateway],
+        try:
+            subprocess.run(
+                ["/sbin/route", "-n", "delete", "-host", ip],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                timeout=2,
             )
-        if res.returncode == 0:
-            applied += 1
-            saved.append({"ip": ip, "gateway": gateway})
+            res = subprocess.run(
+                ["/sbin/route", "-n", "add", "-host", ip, gateway],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+            if res.returncode != 0:
+                res = subprocess.run(
+                    ["/sbin/route", "-n", "change", "-host", ip, gateway],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                )
+            if res.returncode == 0:
+                applied += 1
+                saved.append({"ip": ip, "gateway": gateway})
+        except Exception:
+            pass
 
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -835,6 +932,35 @@ def sync_proxy_bypass_domains() -> None:
                     stderr=subprocess.DEVNULL,
                     timeout=2,
                 )
+        except Exception:
+            pass
+
+
+def disable_browser_quic() -> None:
+    """
+    Disables the experimental QUIC (HTTP/3 over UDP:443) protocol for Google Chrome.
+    SNI reverse proxies only handle TCP/TLS connections and do not forward UDP packets.
+    In Russia, RKN actively drops/throttles UDP port 443 packets to Google, causing Chrome
+    to stall on streaming RPCs (e.g. StreamGenerate) with 'Что-то пошло не так. (1)'.
+    Disabling QUIC forces Chrome to strictly use HTTP/2 over TCP, which flows cleanly.
+    """
+    try:
+        subprocess.run(
+            ["/usr/bin/defaults", "write", "/Library/Preferences/com.google.Chrome", "QuicAllowed", "-bool", "false"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root":
+        try:
+            subprocess.run(
+                ["/usr/bin/su", "-", sudo_user, "-c", "defaults write com.google.Chrome QuicAllowed -bool false"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         except Exception:
             pass
 
@@ -910,16 +1036,16 @@ def update_etc_resolver() -> int:
     resolver_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(resolver_dir, 0o755)
 
-    all_domains = sorted(set(TARGET_HOSTS + EXTRA_RESOLVER_DOMAINS))
-    content = (
-        f"# {NRPT_TAG}\n"
-        f"nameserver 127.0.0.1\n"
-        f"nameserver 37.230.192.51\n"
-        f"nameserver 45.155.204.190\n"
-    )
+    target_set = set(TARGET_HOSTS)
+    all_domains = sorted(target_set | set(EXTRA_RESOLVER_DOMAINS))
+    # For TARGET_HOSTS (pinned in /etc/hosts), only point to 127.0.0.1 (ag_dns) to suppress
+    # AAAA/HTTPS/SVCB in 0ms without ever leaking A-queries to external unverified DNS servers.
+    pinned_content = f"# {NRPT_TAG}\nnameserver 127.0.0.1\n"
+    extra_content = f"# {NRPT_TAG}\nnameserver 127.0.0.1\nnameserver 37.230.192.51\n"
     count = 0
     for domain in all_domains:
         dom = domain.lstrip(".")
+        content = pinned_content if dom in target_set else extra_content
         p = resolver_dir / dom
         try:
             if p.exists() and p.read_text(encoding="utf-8") == content:
@@ -933,7 +1059,7 @@ def update_etc_resolver() -> int:
     return count
 
 
-def update_user_network_config(if_index: int = 0) -> None:
+def update_user_network_config(if_index: int = 0) -> bool:
     sudo_user = os.environ.get("SUDO_USER")
     if sudo_user and sudo_user != "root":
         user_home = Path(f"/Users/{sudo_user}")
@@ -966,6 +1092,7 @@ def update_user_network_config(if_index: int = 0) -> None:
         "provider_order": ["geohide.ru", "dns-ai.ru"],
         "watch_region_errors": True,
         "log_roots": [
+            str(user_home / "Library/Logs/Antigravity"),
             str(user_home / "Library/Application Support/Antigravity/logs"),
             str(user_home / "Library/Application Support/Antigravity IDE/logs"),
             str(user_home / "Library/Application Support/Google Antigravity/logs"),
@@ -981,14 +1108,24 @@ def update_user_network_config(if_index: int = 0) -> None:
     except Exception:
         pass
 
+    relay_cfg_changed = False
+    upstream_txt = "37.230.192.51\n50.7.85.220\n"
     for state_d in [STATE_DIR, LEGACY_RUST_DIR]:
         if state_d.exists():
             try:
-                (state_d / "upstream.conf").write_text("37.230.192.51\n45.155.204.190\n", encoding="utf-8")
+                up_file = state_d / "upstream.conf"
+                if not up_file.exists() or up_file.read_text(encoding="utf-8") != upstream_txt:
+                    up_file.write_text(upstream_txt, encoding="utf-8")
+                    relay_cfg_changed = True
                 if if_index > 0:
-                    (state_d / "iface.conf").write_text(f"{if_index}\n", encoding="utf-8")
+                    if_file = state_d / "iface.conf"
+                    if_txt = f"{if_index}\n"
+                    if not if_file.exists() or if_file.read_text(encoding="utf-8") != if_txt:
+                        if_file.write_text(if_txt, encoding="utf-8")
+                        relay_cfg_changed = True
             except Exception:
                 pass
+    return relay_cfg_changed
 
 
 def install_watchdog_daemon() -> bool:
@@ -1025,27 +1162,47 @@ def install_watchdog_daemon() -> bool:
             ["/bin/launchctl", "bootout", "system/com.antigravity.bypass.watchdog"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            timeout=3,
         )
         subprocess.run(
             ["/bin/launchctl", "bootstrap", "system", str(WATCHDOG_PLIST_PATH)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            timeout=3,
         )
         return True
     except Exception:
         return False
 
 
-def flush_dns_and_restart_relay() -> None:
-    subprocess.run(["/usr/bin/dscacheutil", "-flushcache"], check=False)
-    subprocess.run(["/usr/bin/killall", "-HUP", "mDNSResponder"], check=False)
-    for svc in ["system/com.antigravity.bypass.dns", "system/com.antigravity.bypass.russia"]:
-        subprocess.run(
-            ["/bin/launchctl", "kickstart", "-k", svc],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+def flush_dns_and_restart_relay(restart_relay: bool = False) -> None:
+    for cmd in [
+        ["/usr/bin/dscacheutil", "-flushcache"],
+        ["/usr/bin/killall", "-HUP", "mDNSResponder"],
+    ]:
+        try:
+            subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+                check=False,
+            )
+        except Exception:
+            pass
+
+    if restart_relay:
+        for svc in ["system/com.antigravity.bypass.dns", "system/com.antigravity.bypass.russia"]:
+            try:
+                subprocess.run(
+                    ["/bin/launchctl", "kickstart", "-k", svc],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
+                    check=False,
+                )
+            except Exception:
+                pass
 
 
 def get_active_utun_list() -> list[str]:
@@ -1087,19 +1244,30 @@ def get_monitored_log_files() -> list[Path]:
                             files.append(f)
                     except Exception:
                         pass
+            brain_dir = user_dir / ".gemini/antigravity/brain"
+            if brain_dir.is_dir():
+                for f in brain_dir.glob("*/.system_generated/logs/transcript.jsonl"):
+                    try:
+                        if now - f.stat().st_mtime < 3600:
+                            files.append(f)
+                    except Exception:
+                        pass
     except Exception:
         pass
     return files
 
 
-def scan_logs_for_runtime_failures(log_cursors: dict[str, int], init_only: bool = False) -> tuple[bool, str]:
+def scan_logs_for_runtime_failures(
+    log_cursors: dict[str, int], init_only: bool = False
+) -> tuple[bool, str, list[str]]:
     """
     Closed-loop self-healing log monitor:
-    Reads newly appended bytes in Gemini.app and Antigravity logs in real time.
-    Detects location restrictions, broken pipes, connection resets, and transport failures.
+    Reads newly appended bytes in Gemini.app, Antigravity logs, and active trajectories in real time.
+    Detects location restrictions, TCP timeouts, broken pipes, connection resets, and extracts offending IPs.
     """
     triggered = False
     reason = ""
+    extracted_ips: list[str] = []
     for f in get_monitored_log_files():
         key = str(f)
         try:
@@ -1114,24 +1282,47 @@ def scan_logs_for_runtime_failures(log_cursors: dict[str, int], init_only: bool 
                 fp.seek(read_from)
                 delta = fp.read(sz - read_from).decode("utf-8", errors="ignore")
             log_cursors[key] = sz
+
+            # In transcript.jsonl, ignore lines where the user pasted an old error into chat
+            if f.name == "transcript.jsonl":
+                non_user_lines = [
+                    line for line in delta.splitlines() if '"type":"USER_INPUT"' not in line
+                ]
+                delta = "\n".join(non_user_lines)
+                if not delta:
+                    continue
+
+            for m_ip in re.findall(r"dial tcp (\d+\.\d+\.\d+\.\d+):443", delta):
+                if not looks_like_google(m_ip) and m_ip not in extracted_ips:
+                    extracted_ips.append(m_ip)
+
             if (
                 "locationRejected" in delta
                 or "Domain=com.google.iRPC.Error Code=9" in delta
                 or "User location is not supported" in delta
             ):
-                return True, "locationRejected"
+                return True, "locationRejected", extracted_ips
             if (
                 "broken pipe" in delta
                 or "connection reset by peer" in delta
-                or ("streamGenerateContent" in delta and "request failed" in delta)
+                or (
+                    ("streamGenerateContent" in delta or "googleapis.com" in delta or "dial tcp" in delta)
+                    and (
+                        "request failed" in delta
+                        or "operation timed out" in delta
+                        or "i/o timeout" in delta
+                        or "TLS handshake timeout" in delta
+                        or "connection refused" in delta
+                    )
+                )
             ):
-                return True, "network_reset_broken_pipe"
+                return True, "network_timeout_or_reset", extracted_ips
             if delta.count("Domain=com.google.iRPC.Error Code=14") >= 2:
                 triggered = True
                 reason = "transport_unavailable_code14"
         except Exception:
             pass
-    return triggered, reason
+    return triggered, reason, extracted_ips
 
 
 def run_watchdog_single_pass(force_probe: bool = False, update_sysconfig: bool = False) -> bool:
@@ -1144,10 +1335,7 @@ def run_watchdog_single_pass(force_probe: bool = False, update_sysconfig: bool =
     pinned_ips = list(set(current_pins.values()))
     sync_physical_routes(pinned_ips, gw, update_sysconfig=update_sysconfig)
 
-    has_quarantined_pin = any(
-        current_pins.get(h) in quarantined or current_pins.get(h) == "191.44.41.79"
-        for h in TARGET_HOSTS
-    )
+    has_quarantined_pin = any(current_pins.get(h) in quarantined for h in TARGET_HOSTS)
 
     if not force_probe and not has_quarantined_pin and len(current_pins) >= len(TARGET_HOSTS) and gw:
         canary_hosts = [
@@ -1172,16 +1360,17 @@ def run_watchdog_single_pass(force_probe: bool = False, update_sysconfig: bool =
                 quarantine_ip(ip, ttl_sec=1800, reason=f"canary_fail_{h}")
                 all_healthy = False
                 break
-            if ms > 900:
+            if ms > 1200:
+                # Non-destructive re-rank: do NOT quarantine a working IP on Wi-Fi latency spike
+                # unless a genuinely faster live alternative is verified during re-ranking.
                 print(
-                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [CANARY DEGRADED] IP {ip} latency {ms}ms > 900ms. Quarantining...",
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [CANARY SLOW] IP {ip} latency {ms}ms > 1200ms. Re-evaluating faster proxies...",
                     flush=True,
                 )
-                quarantine_ip(ip, ttl_sec=900, reason=f"canary_slow_{ms}ms")
                 all_healthy = False
                 break
             if h in ("robinfrontend-pa.googleapis.com", "gemini.google.com"):
-                country = check_google_geo_ip(ip, if_index, timeout=2.0)
+                _tcp_ok, country = check_google_geo_ip(ip, if_index, timeout=2.0)
                 if country in GEO_BLOCKED_COUNTRIES:
                     print(
                         f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [CANARY GEO-BLOCK] IP {ip} geo-detected as {country}. Quarantining...",
@@ -1196,35 +1385,66 @@ def run_watchdog_single_pass(force_probe: bool = False, update_sysconfig: bool =
             return False
 
     candidates = discover_candidates(TARGET_HOSTS, if_index)
-    ranked, _geo_map, _q = rank_all_hosts(candidates, if_index)
-    best_ips = {}
-    fallback_pool = load_known_good_ips() + PRIMARY_PROXY_IPS
-    fallback_ip = next((ip for ip in fallback_pool if ip not in load_quarantine()), "193.233.112.67")
+    ranked, _geo_map, current_q = rank_all_hosts(candidates, if_index)
+
+    # Find best verified live IP from this pass (never fall back to an unverified/dead IP)
+    verified_live_ip = None
+    for ref_host in ("daily-cloudcode-pa.googleapis.com", "gemini.google.com", "robinfrontend-pa.googleapis.com"):
+        if ranked.get(ref_host):
+            verified_live_ip = ranked[ref_host][0][0]
+            break
+
+    best_ips: dict[str, str] = {}
     for host in TARGET_HOSTS:
         if ranked.get(host):
             best_ips[host] = ranked[host][0][0]
-        else:
-            best_ips[host] = fallback_ip
+        elif verified_live_ip:
+            best_ips[host] = verified_live_ip
+        elif current_pins.get(host) and current_pins[host] not in current_q:
+            best_ips[host] = current_pins[host]
+        elif current_pins.get(host):
+            best_ips[host] = current_pins[host]
+
+    if not best_ips:
+        return False
 
     changed = best_ips != current_pins
-    update_etc_hosts(best_ips)
+    if changed or len(current_pins) < len(TARGET_HOSTS):
+        update_etc_hosts(best_ips)
     update_etc_resolver()
-    update_user_network_config(if_index)
+    relay_cfg_changed = update_user_network_config(if_index)
     if gw:
         sync_physical_routes(list(set(best_ips.values())), gw, update_sysconfig=True)
-    flush_dns_and_restart_relay()
+    if changed or relay_cfg_changed:
+        flush_dns_and_restart_relay(restart_relay=relay_cfg_changed)
     return changed
 
 
 def run_watchdog_check() -> int:
     """
     Real-time Self-Healing VPN, Route & GeoIP Guardian Daemon:
-    1. Monitors physical gateway (Wi-Fi/Ethernet) changes in real time and re-routes.
-    2. Monitors VPN interfaces (utun* from NetBird, Happ, FortiVPN) and enforces static routes.
-    3. Monitors Antigravity & Gemini logs for broken pipe, connection reset, or location blocks,
-       instantly quarantining bad proxies and failover-switching to healthy ones.
+    1. Hardware Dead-Man's Switch thread: if any pass stalls > 90s (e.g. macOS sleep/wake socket wedge),
+       terminates with os._exit(1) so launchd (KeepAlive=true) cleanly respawns within 1s.
+    2. Monitors physical gateway (Wi-Fi/Ethernet) and VPN (utun*) changes in real time.
+    3. Monitors Antigravity & Gemini logs + transcripts for timeouts, broken pipes, or location blocks.
     4. Periodic re-benchmark every 10 minutes to maintain optimal latency.
     """
+    heartbeat = [time.monotonic()]
+
+    def _deadman_monitor() -> None:
+        while True:
+            time.sleep(10.0)
+            stall = time.monotonic() - heartbeat[0]
+            if stall > 90.0:
+                print(
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [SELF-WATCHDOG] Main loop stalled for {int(stall)}s "
+                    f"(sleep/wake or hung I/O). Exiting for clean launchd respawn...",
+                    flush=True,
+                )
+                os._exit(1)
+
+    threading.Thread(target=_deadman_monitor, daemon=True).start()
+
     last_utuns: list[str] = []
     last_gw: str = ""
     last_probe_ts = 0.0
@@ -1233,9 +1453,10 @@ def run_watchdog_check() -> int:
     last_periodic_ts = 0.0
     log_cursors: dict[str, int] = {}
     scan_logs_for_runtime_failures(log_cursors, init_only=True)
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Self-healing Watchdog started.", flush=True)
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Self-healing Watchdog v{__version__} started.", flush=True)
 
     while True:
+        heartbeat[0] = time.monotonic()
         try:
             now = time.monotonic()
             cur_utuns = get_active_utun_list()
@@ -1248,20 +1469,21 @@ def run_watchdog_check() -> int:
 
             periodic_check = (now - last_periodic_ts) >= 600.0
 
-            log_failed, fail_reason = scan_logs_for_runtime_failures(log_cursors, init_only=False)
+            log_failed, fail_reason, extracted_ips = scan_logs_for_runtime_failures(
+                log_cursors, init_only=False
+            )
             if log_failed and (now - last_heal_ts) >= 10.0:
                 current_pins = read_current_hosts_pins()
-                suspect_ips = sorted(
-                    {
-                        current_pins.get(h, "")
-                        for h in [
-                            "daily-cloudcode-pa.googleapis.com",
-                            "cloudcode-pa.googleapis.com",
-                            "robinfrontend-pa.googleapis.com",
-                        ]
-                        if current_pins.get(h)
-                    }
-                )
+                suspect_set = set(extracted_ips) | {
+                    current_pins.get(h, "")
+                    for h in [
+                        "daily-cloudcode-pa.googleapis.com",
+                        "cloudcode-pa.googleapis.com",
+                        "robinfrontend-pa.googleapis.com",
+                    ]
+                    if current_pins.get(h)
+                }
+                suspect_ips = sorted(x for x in suspect_set if x)
                 ttl = 7200 if "location" in fail_reason else 1800
                 for bad_ip in suspect_ips:
                     quarantine_ip(bad_ip, ttl_sec=ttl, reason=f"runtime_log:{fail_reason}")
@@ -1298,18 +1520,23 @@ def run_watchdog_check() -> int:
                     force_probe=do_probe or log_failed,
                     update_sysconfig=utun_changed or gw_changed or do_probe or log_failed,
                 )
-                last_canary_ts = now
+                heartbeat[0] = time.monotonic()
+                last_canary_ts = heartbeat[0]
                 if do_probe or log_failed:
-                    last_probe_ts = now
+                    last_probe_ts = heartbeat[0]
                     if periodic_check or gw_changed:
-                        last_periodic_ts = now
+                        last_periodic_ts = heartbeat[0]
                     scan_logs_for_runtime_failures(log_cursors, init_only=True)
                 if log_failed and hosts_changed:
-                    subprocess.run(
-                        ["/usr/bin/killall", "Gemini"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
+                    try:
+                        subprocess.run(
+                            ["/usr/bin/killall", "Gemini"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=2,
+                        )
+                    except Exception:
+                        pass
         except Exception as e:
             print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Watchdog error: {e}", flush=True)
 
@@ -1473,9 +1700,16 @@ def main() -> int:
         )
         print(f"      - Авто-карантин (отсеяны): {q_summary}\n")
 
+    verified_live_ip = None
+    for ref_host in ("daily-cloudcode-pa.googleapis.com", "gemini.google.com", "robinfrontend-pa.googleapis.com"):
+        if ranked.get(ref_host):
+            verified_live_ip = ranked[ref_host][0][0]
+            break
+
+    current_pins = read_current_hosts_pins()
     best_ips: dict[str, str] = {}
-    fallback_pool = load_known_good_ips() + PRIMARY_PROXY_IPS
-    fallback_ip = next((ip for ip in fallback_pool if ip not in quarantined), "193.233.112.67")
+    fallback_pool = [ip for ip in load_known_good_ips() if ip not in quarantined]
+    fallback_ip = verified_live_ip or (fallback_pool[0] if fallback_pool else "31.58.216.201")
     print(f"  {'ДОМЕН':<48} | {'ЛУЧШИЙ IP':<15} | {'СКОРОСТЬ':<8} | {'ПРОТОКОЛ / GEO'}")
     print("  " + "-" * 94)
     for host in TARGET_HOSTS:
@@ -1487,8 +1721,9 @@ def main() -> int:
             backup_str = f" [резерв: {backups}]" if backups else ""
             print(f"  {host:<48} | {best_ip:<15} | {best_ms:>5} мс | {alpn}{backup_str}")
         else:
-            best_ips[host] = fallback_ip
-            print(f"  {host:<48} | {fallback_ip:<15} |  резерв  | fallback")
+            chosen = verified_live_ip or current_pins.get(host) or fallback_ip
+            best_ips[host] = chosen
+            print(f"  {host:<48} | {chosen:<15} |  резерв  | fallback")
 
     print()
     if check_only:
@@ -1498,20 +1733,22 @@ def main() -> int:
     print("[4/6] Обновление /etc/hosts и /etc/resolver/<домен> (0 мс отсечка IPv6 AAAA и c-ares)...")
     update_etc_hosts(best_ips)
     res_count = update_etc_resolver()
-    update_user_network_config(if_index)
+    relay_cfg_changed = update_user_network_config(if_index)
     print(f"      - Записано {len(best_ips)} доменов (+ ::1 стоп-записи для c-ares) в /etc/hosts и {res_count} файлов в /etc/resolver/")
 
     print("[5/6] Изоляция от NetBird, FortiVPN и Happ (STATIC /32 маршруты + AdditionalRoutes Wi-Fi):")
     sync_proxy_bypass_domains()
+    disable_browser_quic()
     route_count = sync_physical_routes(list(set(best_ips.values())), gw, update_sysconfig=True)
     print(f"      - Прописано {route_count} постоянных STATIC (UGHS) маршрутов (/32) через шлюз {gw or 'default'}")
     print("      - Домены Google AI добавлены в исключения системного прокси (ProxyBypassDomains)")
+    print("      - Для Google Chrome отключен протокол QUIC/HTTP3 (защита от ошибок отправки в веб-версии)")
 
     print("[6/6] Установка 2-секундного фонового Watchdog-демона, сброс DNS и перезапуск Gemini.app...")
     wd_ok = install_watchdog_daemon()
     # Re-pin routes one final time after daemon & DNS flush so configd never clears them
     sync_physical_routes(list(set(best_ips.values())), gw, update_sysconfig=False)
-    flush_dns_and_restart_relay()
+    flush_dns_and_restart_relay(restart_relay=relay_cfg_changed)
 
     sudo_user = os.environ.get("SUDO_USER")
     if sudo_user and sudo_user != "root":
