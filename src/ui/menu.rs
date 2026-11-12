@@ -289,6 +289,158 @@ pub fn handle_unlock_all() -> bool {
     pause();
     ok
 }
+/// Enable the private CONNECT route without forcing the legacy VPN preflight.
+/// Patching and local gateway startup work even before an upstream proxy is entered.
+pub fn handle_proxy_enable() -> bool {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return handle_unlock_all();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let config = match crate::net::proxy_config::load() {
+            Ok(config) => config,
+            Err(error) => {
+                operation_error("Не удалось прочитать настройки прокси", &error);
+                pause();
+                return false;
+            }
+        };
+        if config.mode == crate::net::proxy_config::Mode::SniDirect {
+            if let Err(error) = crate::net::local_proxy::disable() {
+                operation_error("Не удалось отключить локальный прокси", &error);
+                pause();
+                return false;
+            }
+            return handle_unlock_all();
+        }
+        clear_screen();
+        banner();
+        println!("  НАКАТ ПАТЧА И ЗАПУСК ЛОКАЛЬНОГО ШЛЮЗА\n");
+        println!("  Режим: {}; VPN: {}\n", config.mode, config.vpn_policy);
+        let mut ok = patch_installations().succeeded();
+        if ok {
+            let unready: Vec<_> = find_installations()
+                .iter()
+                .flat_map(|root| find_targets_in_path(root))
+                .filter(|target| {
+                    matches!(
+                        target.kind,
+                        crate::core::detector::TargetKind::LanguageServer
+                            | crate::core::detector::TargetKind::AgyCli
+                    ) && !crate::core::patcher::proxy_env_ready(target)
+                })
+                .collect();
+            if !unready.is_empty() {
+                for target in unready {
+                    operation_error(
+                        "В бинарнике нет подтверждённой переменной AG_LS_PROXY",
+                        &target.path.display().to_string(),
+                    );
+                }
+                ok = false;
+            }
+        }
+        if ok {
+            match crate::net::local_proxy::enable() {
+                Ok(port) => {
+                    println!(
+                        "  \x1b[92m✓\x1b[0m Локальный шлюз запущен: {}",
+                        crate::net::local_proxy::url_at(port)
+                    );
+                    if crate::net::gemini_apps::pac_active() {
+                        println!(
+                            "  \x1b[92m✓\x1b[0m Системный PAC включён: Gemini Web, AI Studio, Chrome и Gemini.app"
+                        );
+                    } else {
+                        println!(
+                            "  \x1b[93m!\x1b[0m Системный PAC пропущен: сохранён ваш сторонний PAC-адрес"
+                        );
+                    }
+                    if crate::net::gemini_apps::stop_gemini_desktop() {
+                        println!(
+                            "  \x1b[92m✓\x1b[0m Фоновые процессы Gemini.app остановлены для чистого перезапуска"
+                        );
+                    }
+                }
+                Err(error) => {
+                    operation_error("Не удалось запустить шлюз или системный PAC", &error);
+                    ok = false;
+                }
+            }
+        }
+        if ok {
+            // Remove only this project's owned legacy DNS/hosts/routes after the new
+            // route is live. Third-party VPN and resolver settings are not deleted.
+            if let Err(error) = remove_dns_rules() {
+                operation_error(
+                    "Локальный шлюз работает, но старые DNS-правила не полностью сняты",
+                    &error,
+                );
+                ok = false;
+            }
+        }
+        if ok && crate::net::gemini_apps::chrome_installed() && crate::net::gemini_apps::chrome_glic_needs_unlock() {
+            let can_unlock = if !crate::net::gemini_apps::chrome_running() {
+                true
+            } else if unsafe { libc::isatty(0) == 1 } {
+                println!("\n  \x1b[96mВстроенный «Спросить Gemini» в Google Chrome\x1b[0m");
+                println!("  Для снятия региональной блокировки в профиле Chrome нужно мягко перезапустить браузер.");
+                if prompt("  Закрыть Chrome сейчас и разблокировать «Спросить Gemini»? [1 = да / 0 = позже]: ") == "1" {
+                    match crate::net::gemini_apps::quit_chrome() {
+                        Ok(()) => true,
+                        Err(error) => {
+                            println!("  \x1b[93m!\x1b[0m {error}");
+                            false
+                        }
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if can_unlock {
+                match crate::net::gemini_apps::unlock_chrome_glic() {
+                    Ok(count) => println!(
+                        "  \x1b[92m✓\x1b[0m Встроенный «Спросить Gemini» в Chrome разблокирован (профилей: {count})"
+                    ),
+                    Err(error) => println!("  \x1b[93m!\x1b[0m Chrome GLIC: {error}"),
+                }
+            } else {
+                println!("  \x1b[93m!\x1b[0m Для кнопки «Спросить Gemini» в Chrome позже выберите пункт [4] → [1].");
+            }
+        }
+        if ok {
+            if crate::net::local_proxy::cli_shortcut_ready() {
+                println!("  \x1b[92m✓\x1b[0m Короткая команда в терминале: ag-bypass");
+            }
+            match &config.upstream {
+                Some(upstream) => {
+                    println!(
+                        "\n  \x1b[92mГотово! Патч, шлюз и PAC активны.\x1b[0m Прокси: {}",
+                        upstream.safe_display()
+                    );
+                    println!("  Перезапустите Antigravity, Gemini.app и обновите вкладку Chrome (⌘Q → открыть снова).");
+                }
+                None if config.mode == crate::net::proxy_config::Mode::Vpn => {
+                    println!("\n  \x1b[92mГотово! Патч и шлюз активны в режиме системного VPN.\x1b[0m");
+                    println!("  Перезапустите Antigravity и Gemini.app (⌘Q → открыть снова).");
+                }
+                None => {
+                    println!("\n  \x1b[92mПатч накачен, локальный шлюз и PAC запущены!\x1b[0m");
+                    println!("  \x1b[93mСледующий шаг:\x1b[0m выберите пункт \x1b[1m[2]\x1b[0m в меню, чтобы вставить свой HTTP-прокси.");
+                    println!("  (После вставки прокси перепатчивать ничего не нужно — просто перезапустите приложения).");
+                }
+            }
+        } else {
+            show_result(false);
+        }
+        pause();
+        ok
+    }
+}
+
 pub fn handle_patch_files_only() -> bool {
     let ok = if let Some(path) = std::env::args().nth(2) {
         patch_root(&expand_env_vars(&path))
@@ -359,10 +511,13 @@ fn ensure_application_closed(paths: &[std::path::PathBuf], action: &str) -> bool
                 return false;
             }
             println!("  \x1b[96mВыберите действие\x1b[0m");
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             println!("  \x1b[1m[1]\x1b[0m  Закрыть Antigravity и продолжить: {action}");
-            #[cfg(not(windows))]
-            println!("  \x1b[1m[1]\x1b[0m  Я закрыл Antigravity — проверить и продолжить");
+            #[cfg(not(any(windows, target_os = "macos")))]
+            {
+                let _ = action;
+                println!("  \x1b[1m[1]\x1b[0m  Я закрыл Antigravity — проверить и продолжить");
+            }
             println!("  \x1b[1m[0]\x1b[0m  Отмена — вернуться в меню\n");
             loop {
                 match prompt("  Введите 1 или 0 и нажмите Enter: ").as_str() {
@@ -374,9 +529,9 @@ fn ensure_application_closed(paths: &[std::path::PathBuf], action: &str) -> bool
                     _ => println!("  Введите номер действия: 1 — продолжить, 0 — отмена."),
                 }
             }
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             println!("\n  Закрываем Antigravity…");
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "macos")))]
             println!("\n  Проверяем открытые файлы…");
             if let Err(error) = crate::system::file_lock::close_application(paths) {
                 operation_error(
@@ -457,13 +612,32 @@ pub fn handle_rollback() -> bool {
         pause();
         return false;
     }
+    if !ok {
+        operation_error(
+            "Сетевые службы сохранены работающими",
+            "Сначала устраните ошибку восстановления файлов: удалять маршрут до исправления бинарника небезопасно.",
+        );
+        pause();
+        return false;
+    }
+    if let Err(error) = crate::net::local_proxy::disable() {
+        operation_error("Не удалось отключить локальный прокси", &error);
+        ok = false;
+    }
     if let Err(e) = remove_dns_rules() {
         operation_error("Не удалось восстановить подключение", &e);
         ok = false;
     }
     if ok {
         println!("  \x1b[92m✓\x1b[0m Настройки подключения восстановлены");
-        println!("\n  \x1b[92mОбход отключён. Можно открыть Antigravity.\x1b[0m");
+        println!("\n  \x1b[92mПолный откат выполнен. Можно открыть Antigravity.\x1b[0m");
+        if crate::net::proxy_config::load()
+            .ok()
+            .and_then(|c| c.upstream)
+            .is_some()
+        {
+            println!("  Сохранённый адрес прокси не удалён (для очистки выберите [2] → clear).");
+        }
     } else {
         eprintln!("\n  Не всё удалось восстановить. Резервные копии сохранены.");
         print_error_details();
@@ -475,11 +649,50 @@ pub fn handle_rollback() -> bool {
 pub fn handle_diagnostics() -> bool {
     clear_screen();
     banner();
-    println!("  ПРОВЕРКА ПОДКЛЮЧЕНИЯ\n");
+    println!("  ПРОВЕРКА ПОДКЛЮЧЕНИЯ И ПРОКСИ\n");
+    let mut ok = true;
+    let summary = crate::net::local_proxy::summary();
+    if summary["listener"] == true {
+        println!(
+            "  \x1b[92m✓\x1b[0m Локальный шлюз: запущен (127.0.0.1:{})",
+            summary["local_port"].as_u64().unwrap_or(0)
+        );
+        if summary["pac_enabled"] == true {
+            println!("  \x1b[92m✓\x1b[0m Системный PAC: активен (Gemini Web / AI Studio / Chrome)");
+        } else if cfg!(target_os = "macos") {
+            println!("  \x1b[93m!\x1b[0m Системный PAC: выключен — выберите пункт [1] с правами sudo");
+        }
+    } else {
+        println!("  \x1b[90m– Локальный шлюз: не запущен\x1b[0m");
+    }
+    if crate::net::gemini_apps::chrome_installed() {
+        if crate::net::gemini_apps::chrome_glic_needs_unlock() {
+            println!("  \x1b[93m!\x1b[0m Gemini в Chrome (Local State): не разблокирован — выберите [4] → [1]");
+        } else {
+            println!("  \x1b[92m✓\x1b[0m Gemini в Chrome (Local State): регион US и флаг GLIC включены");
+        }
+    }
+    match crate::net::proxy_config::load() {
+        Ok(cfg) if cfg.upstream.is_some() => match crate::net::local_proxy::test_upstream() {
+            Ok(msg) => println!("  \x1b[92m✓\x1b[0m Свой прокси: {msg}"),
+            Err(error) => {
+                operation_error("Свой прокси: проверка не прошла", &error);
+                ok = false;
+            }
+        },
+        Ok(cfg)
+            if cfg.mode == crate::net::proxy_config::Mode::OwnProxy
+                && summary["listener"] == true =>
+        {
+            println!("  \x1b[93m!\x1b[0m Свой прокси: не задан — выберите пункт [2] в меню");
+            ok = false;
+        }
+        _ => println!("  \x1b[90m– Свой прокси: не задан\x1b[0m"),
+    }
+    println!();
     let reports = crate::net::health::probe_all();
     let state = crate::net::route_health::store().snapshot();
     let now = crate::net::route_health::now_ms();
-    let mut ok = true;
     if let Err(e) = &state {
         operation_error("Не удалось прочитать историю ошибок подключения", e);
         ok = false;
@@ -554,32 +767,205 @@ pub fn handle_save_diagnostics(directory: Option<&std::path::Path>) -> bool {
     ok
 }
 
+fn handle_proxy_setup() {
+    clear_screen();
+    banner();
+    println!("  ВСТАВИТЬ / СМЕНИТЬ HTTP-ПРОКСИ\n");
+    let current = crate::net::proxy_config::load().ok();
+    match current.as_ref().and_then(|c| c.upstream.as_ref()) {
+        Some(upstream) => println!("  Текущий прокси: \x1b[92m{}\x1b[0m\n", upstream.safe_display()),
+        None => println!("  Текущий прокси: \x1b[90mне задан\x1b[0m\n"),
+    }
+    println!("  Поддерживаемые форматы:");
+    println!("    • login:password@ip:port");
+    println!("    • ip:port:login:password");
+    println!("    • ip:port (без авторизации)\n");
+    println!("  Введите \x1b[1mclear\x1b[0m для удаления прокси или просто нажмите Enter для отмены.\n");
+    let input = match crate::net::proxy_config::read_hidden("  Вставьте прокси (ввод скрыт): ") {
+        Ok(value) => value,
+        Err(error) => {
+            operation_error("Не удалось прочитать строку прокси", &error);
+            pause();
+            return;
+        }
+    };
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        println!("\n  Изменения отменены.");
+        pause();
+        return;
+    }
+    if trimmed.eq_ignore_ascii_case("clear") || trimmed.eq_ignore_ascii_case("delete") {
+        match crate::net::proxy_config::clear_upstream() {
+            Ok(()) => println!("\n  \x1b[92m✓\x1b[0m Прокси удалён из настроек."),
+            Err(error) => operation_error("Не удалось удалить прокси", &error),
+        }
+        pause();
+        return;
+    }
+    let upstream = match crate::net::proxy_config::Upstream::parse(trimmed) {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            println!();
+            operation_error("Некорректный формат прокси", &error);
+            pause();
+            return;
+        }
+    };
+    if let Err(error) = crate::net::proxy_config::save_upstream(upstream.clone()) {
+        println!();
+        operation_error("Не удалось сохранить прокси", &error);
+        pause();
+        return;
+    }
+    println!(
+        "\n  \x1b[92m✓\x1b[0m Сохранено: {} (режим: own-proxy)",
+        upstream.safe_display()
+    );
+    println!("  Проверяем соединение до Google через прокси…");
+    match crate::net::local_proxy::test_upstream() {
+        Ok(msg) => {
+            println!("  \x1b[92m✓\x1b[0m {msg}");
+            if crate::net::local_proxy::summary()["listener"] == true {
+                println!("\n  \x1b[92mШлюз уже работает — новый прокси применён сразу без переустановки!\x1b[0m");
+            } else {
+                println!("\n  \x1b[93mТеперь выберите пункт [1] в меню, чтобы накатить патч и запустить шлюз.\x1b[0m");
+            }
+        }
+        Err(error) => {
+            operation_error("Прокси сохранён, но проверка сейчас не прошла", &error);
+            println!("  Проверьте логин/пароль, порт HTTP CONNECT (не SOCKS) или политику VPN в пункте [3].");
+        }
+    }
+    pause();
+}
+
+fn handle_route_settings() {
+    use crate::net::proxy_config::{self, Mode, VpnPolicy};
+    clear_screen();
+    banner();
+    println!("  РЕЖИМ МАРШРУТА И ПОЛИТИКА VPN\n");
+    if let Ok(cfg) = proxy_config::load() {
+        println!("  Текущий режим: \x1b[96m{}\x1b[0m", cfg.mode);
+        println!("  Политика VPN:  \x1b[96m{}\x1b[0m\n", cfg.vpn_policy);
+    }
+    println!("  [1]  Только свой прокси (own-proxy, рекомендуется)");
+    println!("  [2]  Авто: свой прокси, при сбое — напрямую (auto)");
+    println!("  [3]  Системный VPN без своего прокси (vpn)");
+    println!("  [4]  Резервный публичный DNS/SNI без своего прокси (sni-direct)\n");
+    println!("  [5]  Идти в обход корпоративного VPN (bypass-vpn: FortiVPN / NetBird / Happ)");
+    println!("  [6]  Идти поверх системного маршрута / VPN (use-vpn)");
+    println!("\n  [0]  Назад в меню\n");
+    let choice = prompt("Выберите настройку [0-6]: ");
+    let result = match choice.as_str() {
+        "0" | "" => return,
+        "1" => proxy_config::set_mode(Mode::OwnProxy)
+            .map(|()| "Выбран режим own-proxy. При смене с sni-direct выполните [1]."),
+        "2" => proxy_config::set_mode(Mode::Auto)
+            .map(|()| "Выбран режим auto (прокси с прямым резервом)."),
+        "3" => proxy_config::set_mode(Mode::Vpn)
+            .map(|()| "Выбран режим vpn (через маршрут ОС/VPN)."),
+        "4" => proxy_config::set_mode(Mode::SniDirect)
+            .map(|()| "Выбран режим sni-direct. Нажмите [1] для применения DNS-обхода."),
+        "5" => proxy_config::set_vpn_policy(VpnPolicy::Bypass)
+            .map(|()| "Включён обход VPN (bypass-vpn). Действует сразу на новые соединения."),
+        "6" => proxy_config::set_vpn_policy(VpnPolicy::Use)
+            .map(|()| "Включён системный маршрут (use-vpn). Действует сразу на новые соединения."),
+        _ => {
+            println!("  \x1b[31mНеверный выбор.\x1b[0m");
+            pause();
+            return;
+        }
+    };
+    match result {
+        Ok(msg) => println!("\n  \x1b[92m✓\x1b[0m {msg}"),
+        Err(error) => operation_error("Не удалось сохранить настройку", &error),
+    }
+    pause();
+}
+
+fn handle_chrome_glic_unlock() {
+    clear_screen();
+    banner();
+    println!("  РАЗБЛОКИРОВКА «СПРОСИТЬ GEMINI» В GOOGLE CHROME\n");
+    if !crate::net::gemini_apps::chrome_installed() {
+        operation_error("Google Chrome не найден", "Файл Local State отсутствует");
+        pause();
+        return;
+    }
+    if crate::net::gemini_apps::chrome_running() {
+        println!("  \x1b[93mGoogle Chrome сейчас открыт.\x1b[0m");
+        println!("  Чтобы Chrome не перезаписал Local State при выходе, его нужно мягко закрыть.\n");
+        println!("  [1]  Мягко закрыть Chrome и разблокировать «Спросить Gemini»");
+        println!("  [0]  Отмена\n");
+        if prompt("Выберите [0-1]: ") != "1" {
+            return;
+        }
+        if let Err(error) = crate::net::gemini_apps::quit_chrome() {
+            operation_error("Не удалось закрыть Chrome", &error);
+            pause();
+            return;
+        }
+    }
+    match crate::net::gemini_apps::unlock_chrome_glic() {
+        Ok(count) => {
+            println!(
+                "\n  \x1b[92m✓\x1b[0m Готово! Разблокировано профилей Chrome: {count} (variations_country = us, is_glic_eligible = true)."
+            );
+            println!("  Примечание: встроенная панель «Спросить Gemini» требует личный аккаунт @gmail.com");
+            println!("  и желательно HTTP-прокси с IP США (обычный сайт gemini.google.com работает через любую страну).");
+        }
+        Err(error) => operation_error("Не удалось обновить Local State", &error),
+    }
+    pause();
+}
+
+fn handle_files_submenu() {
+    clear_screen();
+    banner();
+    println!("  ДОПОЛНИТЕЛЬНЫЕ ОПЕРАЦИИ\n");
+    println!("  \x1b[96m[1]\x1b[0m  Разблокировать встроенный «Спросить Gemini» в Chrome (Local State)");
+    println!("  [2]  Пропатчить только файлы Antigravity автоматически");
+    println!("  [3]  Указать путь к папке или бинарнику Antigravity вручную");
+    println!("\n  [0]  Назад в меню\n");
+    match prompt("Выберите действие [0-3]: ").as_str() {
+        "1" => handle_chrome_glic_unlock(),
+        "2" => {
+            handle_patch_files_only();
+        }
+        "3" => handle_manual_path(),
+        _ => {}
+    }
+}
+
 pub fn run_app() {
     loop {
         clear_screen();
         banner();
         print_dashboard();
 
-        println!("  \x1b[92m[1]\x1b[0m  Включить обход");
-        println!("  [2]  Настроить только файлы приложения");
-        println!("  [3]  Настроить только подключение");
-        println!("  [4]  Указать папку Antigravity");
-        println!("  \x1b[96m[5]\x1b[0m  Проверить подключение");
-        println!("  \x1b[91m[6]\x1b[0m  Отключить обход");
+        println!("  \x1b[92m[1]\x1b[0m  Накатить патч и включить шлюз (Antigravity + Gemini)");
+        println!("  \x1b[96m[2]\x1b[0m  Вставить / сменить HTTP-прокси");
+        println!("  [3]  Режим маршрута и VPN");
+        println!("  [4]  Дополнительно (Gemini в Chrome / ручной патч)");
+        println!("  [5]  Проверить подключение и прокси");
+        println!("  \x1b[91m[6]\x1b[0m  Полный откат (восстановить всё)");
         println!("  [7]  Сохранить диагностику");
         println!("\n  [0]  Выход\n");
 
         match prompt("Выберите действие [0-7]: ").as_str() {
             "1" => {
-                handle_unlock_all();
+                handle_proxy_enable();
             }
             "2" => {
-                handle_patch_files_only();
+                handle_proxy_setup();
             }
             "3" => {
-                handle_dns_only();
+                handle_route_settings();
             }
-            "4" => handle_manual_path(),
+            "4" => {
+                handle_files_submenu();
+            }
             "5" => {
                 handle_diagnostics();
             }

@@ -29,16 +29,52 @@ pub fn print_dashboard() {
         "─".repeat(right)
     );
     println!("\x1b[90m│{}│\x1b[0m", " ".repeat(67));
-    let network = if running.is_err() {
-        "\x1b[93mНе удалось проверить службу\x1b[0m"
+    let proxy = crate::net::local_proxy::summary();
+    let listener_on = proxy["listener"] == true;
+    let pac_on = proxy["pac_enabled"] == true;
+    let local_port = proxy["local_port"].as_u64().unwrap_or(0);
+    let network = if listener_on && pac_on {
+        format!("\x1b[92mВключён (шлюз + PAC :{local_port})\x1b[0m")
+    } else if listener_on {
+        format!("\x1b[92mВключён (шлюз :{local_port})\x1b[0m")
+    } else if running.is_err() {
+        "\x1b[93mНе удалось проверить службу\x1b[0m".into()
     } else if rules > 0 && running == Ok(true) {
-        "\x1b[92mВключён\x1b[0m"
+        "\x1b[92mВключён (DNS-маршрут)\x1b[0m".into()
     } else if rules > 0 {
-        "\x1b[93mНужна проверка\x1b[0m"
+        "\x1b[93mНужна проверка\x1b[0m".into()
     } else {
-        "\x1b[90mВыключен\x1b[0m"
+        "\x1b[90mВыключен\x1b[0m".into()
     };
-    status_row("Обход:", network);
+    status_row("Обход:", &network);
+    let proxy_status = match crate::net::proxy_config::load().ok() {
+        Some(cfg) if cfg.upstream.is_some() => {
+            let safe = cfg.upstream.as_ref().unwrap().safe_display();
+            if listener_on {
+                format!("\x1b[92m{safe} ({})\x1b[0m", cfg.vpn_policy)
+            } else {
+                format!("\x1b[93m{safe} (шлюз выкл.)\x1b[0m")
+            }
+        }
+        Some(cfg) if cfg.mode == crate::net::proxy_config::Mode::Vpn => {
+            if listener_on {
+                "\x1b[92mрежим VPN (без прокси)\x1b[0m".into()
+            } else {
+                "\x1b[90mрежим VPN; шлюз выключен\x1b[0m".into()
+            }
+        }
+        Some(cfg) if cfg.mode == crate::net::proxy_config::Mode::SniDirect => {
+            "\x1b[90mпубличный DNS (без прокси)\x1b[0m".into()
+        }
+        _ => {
+            if listener_on {
+                "\x1b[93mне задан — выберите [2]\x1b[0m".into()
+            } else {
+                "\x1b[90mне задан — выберите [2]\x1b[0m".into()
+            }
+        }
+    };
+    status_row("Свой прокси:", &proxy_status);
     status_row("Antigravity:", component_status(status.core_status));
     let ide = if !status.incomplete_ide_installations.is_empty() {
         "\x1b[93mПереустановите Antigravity IDE\x1b[0m"
@@ -80,7 +116,7 @@ fn component_status(status: Option<BinaryState>) -> &'static str {
 }
 
 // Pad the visible text, not ANSI colour sequences, to keep the right border straight.
-fn status_row(label: &str, status: &str) {
+fn format_status_row(label: &str, status: &str) -> String {
     let (colour, icon) = if status.starts_with("\x1b[92m") {
         ("\x1b[92m", "✓")
     } else if status.starts_with("\x1b[93m") {
@@ -88,15 +124,41 @@ fn status_row(label: &str, status: &str) {
     } else {
         ("\x1b[90m", "–")
     };
-    let text = status
+    let raw_text = status
         .strip_prefix(colour)
         .unwrap_or(status)
         .strip_suffix("\x1b[0m")
         .unwrap_or(status);
     let prefix = format!("  {label:<18} ");
+    let max_text = 66usize.saturating_sub(prefix.chars().count() + 4);
+    let text = if raw_text.chars().count() > max_text && max_text > 1 {
+        let head: String = raw_text.chars().take(max_text - 1).collect();
+        format!("{head}…")
+    } else {
+        raw_text.to_string()
+    };
     let padding = 67usize.saturating_sub(prefix.chars().count() + 4 + text.chars().count());
-    println!(
+    format!(
         "\x1b[90m│\x1b[0m{prefix}{colour}[{icon}] {text}\x1b[0m{}\x1b[90m│\x1b[0m",
         " ".repeat(padding)
-    );
+    )
+}
+
+fn status_row(label: &str, status: &str) {
+    println!("{}", format_status_row(label, status));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_status_row;
+
+    #[test]
+    fn long_proxy_labels_truncate_cleanly_without_breaking_frame_width() {
+        let long = "\x1b[92mvery_long_username_12345:***@subdomain.proxy-provider.example.com:65535 (bypass-vpn)\x1b[0m";
+        let rendered = format_status_row("Свой прокси:", long);
+        let plain = regex::Regex::new(r"\x1b\[[0-9;]*m")
+            .unwrap()
+            .replace_all(&rendered, "");
+        assert_eq!(plain.chars().count(), 69, "{plain}");
+    }
 }

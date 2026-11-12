@@ -3,10 +3,14 @@ pub mod config;
 pub mod dns_https;
 pub mod doh;
 pub mod egress;
+pub mod gemini_apps;
 pub mod health;
 pub mod hosts;
+pub mod local_proxy;
 pub mod nrpt;
 pub mod provider;
+pub mod proxy_config;
+pub mod proxy_session;
 pub mod rank;
 pub mod relay;
 pub mod resolver_pool;
@@ -98,8 +102,8 @@ mod tests {
         );
         assert_eq!(super::assemble_nameservers(false, &["1.2.3.4"]), "1.2.3.4");
         assert_eq!(
-            super::assemble_nameservers(false, &[]).split(';').count(),
-            2
+            super::assemble_nameservers(false, &[]),
+            super::resolvers::fallback_v4().join(";")
         );
     }
 

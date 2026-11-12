@@ -294,6 +294,43 @@ fn plan_binary(data: &[u8], kind: TargetKind) -> Result<Plan, String> {
     plan_binary_with_cli_profile(data, kind, false)
 }
 
+fn count_literal(data: &[u8], literal: &[u8]) -> usize {
+    if literal.is_empty() || data.len() < literal.len() {
+        return 0;
+    }
+    data.windows(literal.len())
+        .filter(|window| *window == literal)
+        .count()
+}
+
+fn replace_literal(data: &mut [u8], from: &[u8], to: &[u8]) -> Result<usize, String> {
+    if from.len() != to.len() || from.is_empty() {
+        return Err("Внутренний патч должен сохранять длину файла".into());
+    }
+    let mut changes = 0;
+    let mut offset = 0;
+    while offset + from.len() <= data.len() {
+        if &data[offset..offset + from.len()] == from {
+            data[offset..offset + to.len()].copy_from_slice(to);
+            changes += 1;
+            offset += to.len();
+        } else {
+            offset += 1;
+        }
+    }
+    Ok(changes)
+}
+
+/// Whether the private proxy variable is present and every lower-case stock
+/// lookup has been renamed. Upper-case HTTPS_PROXY remains user-owned.
+pub fn proxy_env_ready(target: &FoundTarget) -> bool {
+    fs::read(&target.path).is_ok_and(|data| {
+        matches!(target.kind, TargetKind::LanguageServer | TargetKind::AgyCli)
+            && count_literal(&data, b"https_proxy") == 0
+            && count_literal(&data, b"AG_LS_PROXY") > 0
+    })
+}
+
 fn plan_binary_with_cli_profile(
     data: &[u8],
     kind: TargetKind,
@@ -302,10 +339,16 @@ fn plan_binary_with_cli_profile(
     let file = object::File::parse(data)
         .map_err(|e| format!("Неподдерживаемый executable (PE/ELF/Mach-O): {e}"))?;
     if kind == TargetKind::AgyCli && file.architecture() == Architecture::Aarch64 && !legacy_cli {
-        return plan_arm64_cli(&file, data);
+        let mut plan = plan_arm64_cli(&file, data)?;
+        apply_proxy_env(&mut plan);
+        return Ok(plan);
     }
     if kind == TargetKind::AgyCli && file.architecture() == Architecture::X86_64 {
-        return plan_x64_cli(data, legacy_cli);
+        let mut plan = plan_x64_cli(data, legacy_cli)?;
+        if !legacy_cli {
+            apply_proxy_env(&mut plan);
+        }
+        return Ok(plan);
     }
     let (original, patched, fix, fix_at, max_matches, profile) = match (kind, file.architecture()) {
         (TargetKind::LanguageServer, Architecture::X86_64) => (
@@ -359,12 +402,30 @@ fn plan_binary_with_cli_profile(
             journal::digest(data)
         ));
     }
-    Ok(Plan {
+    let mut plan = Plan {
         data: output,
         changes,
         existing,
         profile: profile.into(),
-    })
+    };
+    if kind == TargetKind::LanguageServer {
+        apply_proxy_env(&mut plan);
+    }
+    Ok(plan)
+}
+
+fn apply_proxy_env(plan: &mut Plan) {
+    let stock = count_literal(&plan.data, b"https_proxy");
+    let patched = count_literal(&plan.data, b"AG_LS_PROXY");
+    if stock > 0 {
+        // Same length and known literal: no relocation or file-size change.
+        plan.changes +=
+            replace_literal(&mut plan.data, b"https_proxy", b"AG_LS_PROXY").unwrap_or(0);
+    }
+    plan.existing += patched;
+    if stock + patched > 0 {
+        plan.profile.push_str("+proxy-env-v1");
+    }
 }
 
 fn plan(data: &[u8], kind: TargetKind) -> Result<Plan, String> {
@@ -767,6 +828,24 @@ mod tests {
     }
 
     #[test]
+    fn private_proxy_variable_is_same_length_and_part_of_exact_rollback_plan() {
+        let gate = b"\x80\x78\x08\x00\x74\x0a\x48\x8b\x44\x24\x20\x48\x89\x44\x60";
+        let mut original = macho_fixture(gate, 0x01000007);
+        original[900..911].copy_from_slice(b"https_proxy");
+        original[920..931].copy_from_slice(b"HTTPS_PROXY");
+        let patched = plan_binary(&original, TargetKind::LanguageServer).unwrap();
+        assert_eq!((patched.changes, patched.existing), (2, 0));
+        assert_eq!(patched.data.len(), original.len());
+        assert_eq!(&patched.data[900..911], b"AG_LS_PROXY");
+        assert_eq!(&patched.data[920..931], b"HTTPS_PROXY");
+        assert_eq!(count_literal(&patched.data, b"https_proxy"), 0);
+        assert!(patched.profile.ends_with("+proxy-env-v1"));
+        let repeated = plan_binary(&patched.data, TargetKind::LanguageServer).unwrap();
+        assert_eq!((repeated.changes, repeated.existing), (0, 2));
+        assert_eq!(repeated.data, patched.data);
+    }
+
+    #[test]
     fn x64_cli_patches_every_copy_of_the_same_gate() {
         let gate =
             b"\x48\x85\xc0\x0f\x84\x0a\x00\x00\x00\x80\x78\x08\x00\x0f\x85\x00\x00\x00\x00\x11\x22";
@@ -813,18 +892,29 @@ mod tests {
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].kind, TargetKind::AgyCli);
         let stock = fs::read(path).unwrap();
+        let proxy_vars = count_literal(&stock, b"https_proxy");
+        assert!(proxy_vars > 0);
         let patched = plan_binary(&stock, TargetKind::AgyCli).unwrap();
-        assert_eq!((patched.changes, patched.existing), (gates, 0));
+        assert_eq!((patched.changes, patched.existing), (gates + proxy_vars, 0));
+        let mut without_proxy_env = patched.data.clone();
+        assert_eq!(
+            replace_literal(&mut without_proxy_env, b"AG_LS_PROXY", b"https_proxy").unwrap(),
+            proxy_vars
+        );
         assert_eq!(
             stock
                 .iter()
-                .zip(&patched.data)
+                .zip(&without_proxy_env)
                 .filter(|(a, b)| a != b)
                 .count(),
             gates * 4
         );
+        drop(without_proxy_env);
         let repeated = plan_binary(&patched.data, TargetKind::AgyCli).unwrap();
-        assert_eq!((repeated.changes, repeated.existing), (0, gates));
+        assert_eq!(
+            (repeated.changes, repeated.existing),
+            (0, gates + proxy_vars)
+        );
         assert_eq!(repeated.data, patched.data);
         drop(repeated);
         drop(patched);
@@ -850,7 +940,10 @@ mod tests {
                     prepare_for_write(&target.path, legacy.data.clone(), target.kind).unwrap();
                 journal::apply(&target.path, Some(&stock), &signed, "agy-x64-long-v1").unwrap();
             }
-            assert_eq!(patch_target(&target).unwrap(), PatchOutcome::Changed(gates));
+            assert_eq!(
+                patch_target(&target).unwrap(),
+                PatchOutcome::Changed(gates + proxy_vars)
+            );
             assert_eq!(patch_target(&target).unwrap(), PatchOutcome::AlreadyPatched);
             assert_eq!(restore_target(&target).unwrap(), PatchOutcome::Restored);
             assert_eq!(fs::read(&target.path).unwrap(), stock);
@@ -1300,8 +1393,10 @@ mod tests {
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].kind, TargetKind::AgyCli);
         let stock = fs::read(path).unwrap();
+        let proxy_vars = count_literal(&stock, b"https_proxy");
+        assert!(proxy_vars > 0);
         let patched = plan_binary(&stock, TargetKind::AgyCli).unwrap();
-        assert_eq!((patched.changes, patched.existing), (2, 0));
+        assert_eq!((patched.changes, patched.existing), (2 + proxy_vars, 0));
         let mut expected = stock.clone();
         let file = object::File::parse(stock.as_slice()).unwrap();
         for section in file.sections().filter(|s| s.kind() == SectionKind::Text) {
@@ -1317,16 +1412,20 @@ mod tests {
                 expected[at..at + CLI_GATE_ARM64_FIX.len()].copy_from_slice(CLI_GATE_ARM64_FIX);
             }
         }
+        assert_eq!(
+            replace_literal(&mut expected, b"https_proxy", b"AG_LS_PROXY").unwrap(),
+            proxy_vars
+        );
         // No other bytes, including nil/error branches and Mach-O metadata, change.
         assert_eq!(patched.data, expected);
         drop(expected);
         let legacy = plan_binary_with_cli_profile(&stock, TargetKind::AgyCli, true).unwrap();
         assert_eq!((legacy.changes, legacy.existing), (1, 0));
         let upgrade = plan_binary(&legacy.data, TargetKind::AgyCli).unwrap();
-        assert_eq!((upgrade.changes, upgrade.existing), (1, 1));
+        assert_eq!((upgrade.changes, upgrade.existing), (1 + proxy_vars, 1));
         assert_eq!(upgrade.data, patched.data);
         let repeated = plan_binary(&patched.data, TargetKind::AgyCli).unwrap();
-        assert_eq!((repeated.changes, repeated.existing), (0, 2));
+        assert_eq!((repeated.changes, repeated.existing), (0, 2 + proxy_vars));
         assert_eq!(repeated.data, patched.data);
         drop(upgrade);
         drop(repeated);
@@ -1354,7 +1453,11 @@ mod tests {
             }
             assert_eq!(
                 patch_target(&target).unwrap(),
-                PatchOutcome::Changed(if migrate { 1 } else { 2 })
+                PatchOutcome::Changed(if migrate {
+                    1 + proxy_vars
+                } else {
+                    2 + proxy_vars
+                })
             );
             assert_eq!(patch_target(&target).unwrap(), PatchOutcome::AlreadyPatched);
             assert_eq!(restore_target(&target).unwrap(), PatchOutcome::Restored);

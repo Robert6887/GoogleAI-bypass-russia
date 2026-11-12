@@ -7,7 +7,40 @@ pub fn holders(paths: &[PathBuf]) -> Result<Vec<String>, String> {
 }
 
 pub fn close_application(paths: &[PathBuf]) -> Result<(), String> {
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let pids = macos_holder_pids(paths)?;
+        if pids.is_empty() {
+            return Ok(());
+        }
+        let protected = macos_ancestor_pids(std::process::id());
+        if pids.iter().any(|pid| protected.contains(pid)) {
+            return Err(
+                "Утилита запущена внутри встроенного терминала Antigravity. Откройте стандартный Терминал macOS, чтобы закрыть IDE без обрыва."
+                    .into(),
+            );
+        }
+        for &pid in &pids {
+            if pid > 1 {
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if holders(paths)?.is_empty() {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        return if holders(paths)?.is_empty() {
+            Ok(())
+        } else {
+            Err("Закройте Antigravity вручную (сохраните открытые файлы) и повторите.".into())
+        };
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     return if holders(paths)?.is_empty() {
         Ok(())
     } else {
@@ -234,7 +267,11 @@ fn query(paths: &[PathBuf]) -> Result<Vec<String>, String> {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn parse_lsof(code: Option<i32>, stdout: &str, stderr: &str) -> Result<Vec<String>, String> {
+fn parse_lsof_entries(
+    code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<Vec<(u32, String)>, String> {
     if !matches!(code, Some(0 | 1)) || !stderr.trim().is_empty() {
         return Err(format!(
             "Проверка открытых файлов: код {code:?}; {}",
@@ -252,7 +289,7 @@ fn parse_lsof(code: Option<i32>, stdout: &str, stderr: &str) -> Result<Vec<Strin
             );
         } else if let Some(name) = line.strip_prefix('c') {
             if let Some(pid) = pid.take() {
-                result.push(format!("{name} (PID {pid})"));
+                result.push((pid, name.to_string()));
             }
         }
     }
@@ -262,6 +299,75 @@ fn parse_lsof(code: Option<i32>, stdout: &str, stderr: &str) -> Result<Vec<Strin
     result.sort();
     result.dedup();
     Ok(result)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_lsof(code: Option<i32>, stdout: &str, stderr: &str) -> Result<Vec<String>, String> {
+    let mut formatted: Vec<_> = parse_lsof_entries(code, stdout, stderr)?
+        .into_iter()
+        .map(|(pid, name)| format!("{name} (PID {pid})"))
+        .collect();
+    formatted.sort();
+    formatted.dedup();
+    Ok(formatted)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_holder_pids(paths: &[PathBuf]) -> Result<Vec<u32>, String> {
+    if paths.is_empty() {
+        return Ok(vec![]);
+    }
+    let output = crate::system::command::output(
+        "lsof",
+        ["-n", "-P", "-Fpc", "--"]
+            .into_iter()
+            .map(std::ffi::OsStr::new)
+            .chain(paths.iter().map(|p| p.as_os_str())),
+    )
+    .map_err(|e| format!("Проверка открытых файлов: {e}"))?;
+    let mut pids: Vec<_> = parse_lsof_entries(
+        output.status.code(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )?
+    .into_iter()
+    .map(|(pid, _)| pid)
+    .collect();
+    pids.sort();
+    pids.dedup();
+    Ok(pids)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_ps_ancestors(stdout: &str, current: u32) -> std::collections::HashSet<u32> {
+    let pairs: Vec<(u32, u32)> = stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let pid = parts.next()?.parse().ok()?;
+            let ppid = parts.next()?.parse().ok()?;
+            Some((pid, ppid))
+        })
+        .collect();
+    let mut protected = std::collections::HashSet::new();
+    let mut pid = current;
+    while pid != 0 && protected.insert(pid) {
+        match pairs.iter().find(|(p, _)| *p == pid) {
+            Some((_, parent)) => pid = *parent,
+            None => break,
+        }
+    }
+    protected
+}
+
+#[cfg(target_os = "macos")]
+fn macos_ancestor_pids(current: u32) -> std::collections::HashSet<u32> {
+    match crate::system::command::output("ps", ["-ax", "-o", "pid=,ppid="]) {
+        Ok(out) if out.status.success() => {
+            parse_ps_ancestors(&String::from_utf8_lossy(&out.stdout), current)
+        }
+        _ => [current].into_iter().collect(),
+    }
 }
 
 #[cfg(test)]
@@ -277,6 +383,14 @@ mod mac_lock_tests {
         assert!(super::parse_lsof(Some(1), "", "").unwrap().is_empty());
         assert!(super::parse_lsof(Some(1), "", "permission denied").is_err());
         assert!(super::parse_lsof(Some(0), "unexpected output", "").is_err());
+    }
+
+    #[test]
+    fn ps_ancestors_walk_parent_chain_without_cycles_or_siblings() {
+        let sample = "  1   0\n 40   1\n 30  40\n 20  30\n 10  20\n 50  30\n";
+        let ancestors = super::parse_ps_ancestors(sample, 10);
+        assert_eq!(ancestors, [10, 20, 30, 40, 1].into_iter().collect());
+        assert!(!ancestors.contains(&50));
     }
 }
 

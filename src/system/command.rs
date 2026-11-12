@@ -52,10 +52,14 @@ pub fn executable(program: &str) -> io::Result<PathBuf> {
     #[cfg(unix)]
     let path = PathBuf::from(match program {
         "launchctl" => "/bin/launchctl",
-        "route" => "/sbin/route",
+        "ps" => "/bin/ps",
+        "route" | "/sbin/route" => "/sbin/route",
+        "ipconfig" | "/usr/sbin/ipconfig" => "/usr/sbin/ipconfig",
+        "networksetup" => "/usr/sbin/networksetup",
         "sysctl" => "/usr/sbin/sysctl",
         "lsof" => "/usr/sbin/lsof",
         "scutil" => "/usr/sbin/scutil",
+        "osascript" => "/usr/bin/osascript",
         "codesign" => "/usr/bin/codesign",
         "xattr" => "/usr/bin/xattr",
         "pgrep" => "/usr/bin/pgrep",
@@ -210,10 +214,14 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 let commands = [
                     "launchctl",
+                    "ps",
                     "route",
+                    "ipconfig",
+                    "networksetup",
                     "sysctl",
                     "lsof",
                     "scutil",
+                    "osascript",
                     "codesign",
                     "xattr",
                     "pgrep",
@@ -302,6 +310,10 @@ mod tests {
                 "stat",
                 "sysctl",
                 "launchctl",
+                "ps",
+                "ipconfig",
+                "networksetup",
+                "osascript",
             ] {
                 std::fs::write(directory.path().join(name), b"invalid executable").unwrap();
             }

@@ -31,7 +31,11 @@ case "$arch" in
         script += f"{arch})\nbase64 -D <<'ANTIGRAVITY_ENGINE' | gzip -d > \"$engine\"\n{payload}\nANTIGRAVITY_ENGINE\n;;\n"
     return script + '''esac
 chmod 700 "$engine"
-"$engine" "$@"
+if [[ ! -t 0 && -t 1 && -r /dev/tty ]]; then
+  "$engine" "$@" < /dev/tty
+else
+  "$engine" "$@"
+fi
 '''
 
 

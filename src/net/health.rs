@@ -54,7 +54,7 @@ fn probe_with_connector(
     // Incremental parsing also enforces the total deadline for a trickling peer.
     let mut header = Vec::new();
     let mut byte = [0u8; 1];
-    while header.len() < 16 * 1024 {
+    while header.len() < 64 * 1024 {
         if Instant::now() >= deadline {
             return Err("HTTP header: timeout".into());
         }
@@ -77,7 +77,7 @@ fn probe_with_connector(
             Err(e) => return Err(e.to_string()),
         }
     }
-    Err("HTTP header exceeds 16 KiB".into())
+    Err("HTTP header exceeds 64 KiB".into())
 }
 
 pub fn probe_ip(addr: SocketAddr, host: &str) -> Result<u128, String> {

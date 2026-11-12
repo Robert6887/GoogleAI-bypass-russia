@@ -7,6 +7,27 @@
 
 ---
 
+## [2.7.0] - 2026-11-12
+
+### Добавлено и улучшено
+- **Единое интерактивное меню `[0-7]` и запуск одной командой с GitHub**:
+  - Поддержка прямого интерактивного запуска `curl -fsSL .../unlock_and_restore.sh | bash` через `/dev/tty`.
+  - Разделение этапов: пункт `[1]` накатывает бинарный патч и запускает локальный шлюз даже до настройки прокси, пункт `[2]` позволяет в любой момент вставить или заменить HTTP-прокси на лету с автопроверкой `CONNECT + TLS + HTTP`, пункт `[6]` выполняет полный чистый откат.
+  - Автоматическая установка короткого ярлыка `/usr/local/bin/ag-bypass` на macOS (с чистым удалением при откате).
+- **Универсальный парсер форматов прокси**:
+  - При вставке принимаются `login:password@ip:port`, `ip:port:login:password`, `ip:port@login:password`, `http://...` и `ip:port`.
+- **Локальный HTTP CONNECT-шлюз, точечный PAC и поддержка всей экосистемы Gemini**:
+  - Переименование `https_proxy` → `AG_LS_PROXY` без изменения длины бинарников и запуск пользовательского LaunchAgent `com.antigravity.bypass.local-proxy`.
+  - Раздача локального `/proxy.pac` и автонастройка PAC на физических интерфейсах macOS (`en*`) исключительно для доменов Google AI (`gemini.google.com`, `aistudio.google.com`, `generativelanguage.googleapis.com`, `notebooklm.google.com` и др.), оставляя весь остальной трафик `DIRECT`.
+  - Поддержка нативного **Gemini Desktop** (`/Applications/Gemini.app`) через системный PAC (`NWConnection`) и изолированную переменную GUI-сессии `grpc_proxy` + домены `robinfrontend-pa.googleapis.com` / `proactivebackend-pa.googleapis.com` / `directpath-pa.googleapis.com`.
+  - Разблокировка встроенной панели **«Спросить Gemini» в Google Chrome (GLIC)** (`geminiweb-pa.googleapis.com`, `aratea-pa.googleapis.com` + `Local State`: `variations_country = "us"`, `is_glic_eligible = true` с хирургическим бэкапом и откатом в `[6]`).
+  - Политика `bypass-vpn` (`IP_BOUND_IF` / `IPV6_BOUND_IF`) по умолчанию для работы параллельно с `FortiVPN`, `NetBird` и `Happ`.
+- **Безопасное авто-закрытие Antigravity на macOS и удаление legacy**:
+  - Проверка цепочки родительских PID перед мягким завершением процессов Antigravity.
+  - Удалены устаревшие файлы `macos-instant-fix.py`, `.command`-скрипты и старые бинарные артефакты.
+
+---
+
 ## [2.6.0] - 2026-10-20
 
 ### Исправлено и улучшено

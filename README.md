@@ -1,91 +1,144 @@
 # GoogleAI-bypass-russia
 
-Скрипт и фоновая служба для macOS, позволяющие работать с **Google Antigravity IDE** (включая голосовой ввод), десктопным **Gemini.app** и **Google AI Studio** из РФ без VPN или параллельно с включённым корпоративным VPN (`FortiClient`, `NetBird`, `Happ`).
+Утилита с интерактивным терминальным меню `[0-7]` для работы из РФ через собственный **HTTP CONNECT-прокси** (параллельно с включённым корпоративным VPN `FortiVPN`, `NetBird`, `Happ` и без глобального проксирования всего трафика):
 
-Решает типичные проблемы:
-- ошибки `Region not supported`, `User location is not supported`, `locationRejected` (`com.google.iRPC.Error Code=9`);
-- таймауты и обрывы генерации в Antigravity (`streamGenerateContent`, `dial tcp ... connect: operation timed out`, `broken pipe`);
-- сброс записи микрофона в Antigravity сразу после нажатия (`aicode.googleapis.com`);
-- возврат отправленного сообщения обратно в поле ввода в нативном `Gemini.app` (`robinfrontend-pa.googleapis.com`).
+- **Google Antigravity IDE** (чат, агент, голосовой ввод и `agy` CLI)
+- **Gemini в вебе** (`gemini.google.com`), **Google AI Studio** (`aistudio.google.com`), **NotebookLM** (`notebooklm.google.com`) и **Gemini API** (`generativelanguage.googleapis.com`)
+- **Gemini Desktop для macOS** (`/Applications/Gemini.app`)
+- **Встроенный «Спросить Gemini» в Google Chrome** (панель GLIC)
 
 ---
 
-## Установка и запуск (macOS)
+## Быстрый старт (macOS — Apple Silicon и Intel)
 
-Откройте Терминал и выполните:
+Ничего собирать вручную и устанавливать Rust не нужно. Откройте **Терминал** и выполните одну команду:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Robert6887/GoogleAI-bypass-russia/main/macos-instant-fix.py -o macos-instant-fix.py && sudo /usr/bin/python3 macos-instant-fix.py
+curl -fsSL https://github.com/Robert6887/GoogleAI-bypass-russia/releases/latest/download/unlock_and_restore.sh | bash
 ```
 
-Либо скачайте архив репозитория и запустите `Apply_Antigravity_Gemini_Fix.command` двойным кликом из Finder.
+Откроется интерактивное меню со статусом компонентов:
 
-### Проверка без изменения системы
+```text
+  [1]  Накатить патч и включить шлюз (Antigravity + Gemini)
+  [2]  Вставить / сменить HTTP-прокси
+  [3]  Режим маршрута и VPN
+  [4]  Дополнительно (Gemini в Chrome / ручной патч)
+  [5]  Проверить подключение и прокси
+  [6]  Полный откат (восстановить всё)
+  [7]  Сохранить диагностику
 
-Посмотреть доступные прокси-узлы, задержку HTTP/2 и вердикт GeoIP Google без записи в `/etc/hosts` и таблицу маршрутизации:
-
-```bash
-/usr/bin/python3 macos-instant-fix.py --check-only
+  [0]  Выход
 ```
 
-### Откат изменений (Rollback)
+### Настройка в два шага
 
-Удалить фоновую службу, очистить записи в `/etc/hosts`, `/etc/resolver` и убрать статические маршруты:
+1. Нажмите **`1`** — утилита пропатчит Antigravity и CLI, запустит локальный шлюз `127.0.0.1:53129`, включит точечный системный **PAC-файл** (`http://127.0.0.1:53129/proxy.pac` — проксирует **только** домены Google AI, все обычные сайты идут напрямую), настроит `grpc_proxy` для десктопного `Gemini.app`, предложит разблокировать встроенный **«Спросить Gemini» в Chrome** и создаст короткую команду `ag-bypass`.
+2. Нажмите **`2`** — вставьте ваш HTTP-прокси (ввод скрыт) и нажмите `Enter`. Утилита сразу проверит `HTTP CONNECT + TLS + HTTP` до серверов Google.
+3. Перезапустите Antigravity и `Gemini.app` (`⌘Q` → открыть снова) и обновите вкладку `gemini.google.com` в Chrome.
+
+> **Важно для кнопки «Спросить Gemini» в правом верхнем углу Chrome (GLIC):** в отличие от сайта `gemini.google.com` и `Gemini.app` (которые работают через прокси почти любой страны Европы/США/Азии), встроенная боковая панель Chrome дополнительно требует:
+> 1) разблокировку `Local State` (выполняется автоматически в пункте **`1`** или отдельно через **`[4]` → `[1]`** / `ag-bypass chrome-gemini`);
+> 2) **личный аккаунт `@gmail.com`** (не корпоративный Workspace с отключённым ИИ) и желательно **HTTP-прокси с IP США**.
+
+> **Удобная смена прокси на лету:** после первой установки меню открывается из любой папки просто по команде **`ag-bypass`**. Менять прокси через пункт **`2`** (или `ag-bypass proxy set`) можно в любой момент **без повторного патча и без `sudo`** — локальный шлюз подхватывает новый адрес автоматически на следующем соединении.
+
+### Полный откат
+
+Запустите `ag-bypass` (или команду с GitHub выше) и выберите **`6`**. Утилита восстановит оригинальные бинарные файлы по журналу контрольных сумм, очистит кэш V8, вернёт исходное окружение `AG_LS_PROXY` и удалит LaunchAgent.
+
+---
+
+## Что нужно от прокси
+
+- Обычный **HTTP-прокси с поддержкой метода `CONNECT` к порту `443`**.
+- Поддерживаются все популярные форматы при вставке:
+  - `login:password@ip:port` (или `http://login:password@ip:port`)
+  - `ip:port:login:password`
+  - `ip:port@login:password`
+  - `ip:port` (без авторизации)
+- `SOCKS4/SOCKS5` и `HTTPS`-подключение к самому прокси не используются.
+- Прокси должен находиться в регионе, где доступен Google AI / Antigravity.
+
+---
+
+## Работа вместе с корпоративным VPN (FortiVPN, NetBird, Happ)
+
+По умолчанию включена политика **`bypass-vpn`**: исходящие сокеты локального шлюза привязываются напрямую к физическому сетевому интерфейсу macOS (`IP_BOUND_IF` / `IPV6_BOUND_IF`) мимо виртуального туннеля VPN, не трогая маршруты, DNS или настройки самого VPN-клиента.
+
+Переключить режим маршрута или политику VPN можно в пункте **`3`** меню:
+
+| Режим / политика | Описание |
+| --- | --- |
+| `own-proxy` *(по умолчанию)* | Трафик моделей идёт строго через ваш HTTP-прокси без скрытого прямого fallback. |
+| `auto` | Сначала ваш HTTP-прокси, при сетевой ошибке — прямое подключение. |
+| `vpn` | Прямой туннель через системный маршрут / активный VPN (без внешнего прокси). |
+| `sni-direct` | Резервный публичный DNS/SNI-режим без собственного прокси. |
+| `bypass-vpn` *(по умолчанию)* | Привязка сокетов к физическому Wi-Fi/Ethernet в обход системного VPN. |
+| `use-vpn` | Обычная маршрутизация через таблицу маршрутов ОС / активный VPN. |
+
+---
+
+## Команды CLI (без входа в меню)
+
+После установки все операции доступны также напрямую через `ag-bypass`:
 
 ```bash
-sudo /usr/bin/python3 macos-instant-fix.py --rollback
+# Открыть интерактивное меню [0-7]
+ag-bypass
+
+# Вставить/сменить прокси (с автопроверкой), посмотреть статус или очистить
+ag-bypass proxy set
+ag-bypass proxy test
+ag-bypass proxy status
+ag-bypass proxy clear
+
+# Переключить режим или политику VPN
+ag-bypass mode own-proxy
+ag-bypass vpn bypass
+
+# Накатить патч и шлюз (или обновить после апдейта Antigravity)
+sudo ag-bypass install
+
+# Разблокировать встроенный «Спросить Gemini» в Google Chrome (Local State)
+ag-bypass chrome-gemini
+
+# Проверить прокси и соединение
+ag-bypass doctor
+ag-bypass doctor --json
+
+# Полный откат
+sudo ag-bypass rollback
 ```
-*(или запустить `Rollback_Antigravity_Gemini_Fix.command` из Finder).*
 
 ---
 
-## Что именно делает скрипт
+## Windows 10 / 11
 
-1. **Подбор и проверка SNI-прокси (TLS 1.3 + HTTP/2 + GeoIP)**
-   Скрипт собирает пул адресов из нескольких DNS/DoH источников (`dns-ai.ru`, `geohide.ru`, `xbox-dns.ru`, локальный кэш), отсеивает недоступные по TCP:443 серверы и проверяет на оставшихся:
-   - реальное рукопожатие TLS и получение фрейма `HTTP/2 SETTINGS` для каждого из 13 доменов;
-   - страну выходного узла глазами самого Google (`WIZ_global_data.vXmutd` на `gemini.google.com/app`). Если Google определяет прокси как `RU`/`BY` и т.д., адрес отправляется в карантин.
-
-2. **Точечная маршрутизация мимо VPN (`/32` и `IP_BOUND_IF`)**
-   Если на компьютере включён корпоративный или личный VPN (`FortiVPN`, `NetBird`, `Happ`), который заворачивает весь трафик в туннель или выставляет системный прокси:
-   - скрипт находит физический интерфейс (`en0`) и IP домашнего/офисного роутера (`ipconfig getoption en0 router`);
-   - привязывает проверочные сокеты напрямую к физическому адаптеру через `setsockopt(IPPROTO_IP, IP_BOUND_IF)`;
-   - прописывает статические хост-маршруты `/32` (`route -n add -host <IP> <GATEWAY>`) и `AdditionalRoutes` для Wi-Fi, а также добавляет домены Google AI в `ProxyBypassDomains`. Весь остальной трафик продолжает идти через ваш VPN как обычно.
-
-3. **Защита от утечки IPv6 в `Gemini.app`**
-   Нативный клиент `Gemini.app` использует gRPC с резолвером `c-ares`, который игнорирует `/etc/resolver` и при наличии IPv6 пытается идти напрямую в Google в обход IPv4-прокси. Для доменов `Gemini.app` в `/etc/hosts` добавляются стоп-записи `::1`, а в окружение `launchctl` прописывается `GRPC_DNS_RESOLVER=native`. Для Chrome дополнительно отключается QUIC (`QuicAllowed = false`), чтобы браузер не пытался стучаться по UDP:443.
-
-4. **Фоновый демон `com.antigravity.bypass.watchdog`**
-   После первого запуска скрипт ставит `LaunchDaemon`, который крутится в фоне с правами `root` и не требует повторного ввода пароля:
-   - при переключении между сетями Wi-Fi или переподключении VPN за 2 секунды перестраивает маршруты `/32` под новый шлюз;
-   - каждые 25 секунд проверяет доступность текущих прокси;
-   - следит за логами Antigravity (`~/Library/Logs/Antigravity/language_server.log`, активные `transcript.jsonl`) и `Gemini.app`. При появлении `operation timed out`, `broken pipe`, `connection reset by peer` или `locationRejected` автоматически отправляет проблемный IP в карантин и переключает `/etc/hosts` на живой резерв;
-   - имеет встроенный сторожевой таймер (`_deadman_monitor`): если после сна macOS сетевой поток зависнет дольше чем на 90 секунд, процесс перезапустится через `launchd`.
+Скачайте `antigravity-bypass-russia.exe` со страницы [Releases](https://github.com/Robert6887/GoogleAI-bypass-russia/releases/latest), запустите от имени Администратора и используйте пункты меню **`1`** (включить обход), **`4` → `1`** (разблокировать Gemini в Chrome) и **`6`** (полный откат).
 
 ---
 
-## Обслуживаемые домены
+## Как устроен маршрут на macOS
 
-| Назначение | Домены |
-| :--- | :--- |
-| **Antigravity IDE** | `daily-cloudcode-pa.googleapis.com`, `cloudcode-pa.googleapis.com`, `generativelanguage.googleapis.com` |
-| **Голосовой ввод Antigravity** | `aicode.googleapis.com` |
-| **Gemini.app (macOS)** | `robinfrontend-pa.googleapis.com`, `webchannel-robinfrontend-pa.googleapis.com`, `proactivebackend-pa.googleapis.com`, `geller-pa.googleapis.com`, `gemini.google.com` |
-| **Google AI Studio** | `aistudio.google.com`, `alkalimakersuite-pa.clients6.google.com`, `alkalicore-pa.clients6.google.com`, `webchannel-alkalimakersuite-pa.clients6.google.com` |
+```text
+Antigravity (AG_LS_PROXY) / Gemini.app (grpc_proxy + PAC) / Chrome (PAC /proxy.pac)
+  → HTTP CONNECT 127.0.0.1:53129 (локальный шлюз)
+  → ваш HTTP CONNECT-прокси (только домены Google AI / Gemini)
+  → Google (сквозной TLS без расшифровки)
+```
+
+Через внешний прокси направляются только домены моделей, голосового ввода, Gemini Web, AI Studio, NotebookLM, `Gemini.app` и Chrome GLIC (`daily-cloudcode-pa.googleapis.com`, `cloudcode-pa.googleapis.com`, `aicode.googleapis.com`, `generativelanguage.googleapis.com`, `aistudio.google.com`, `gemini.google.com`, `robinfrontend-pa.googleapis.com`, `optimizationguide-pa.googleapis.com`, `accountcapabilities-pa.googleapis.com` и др.). Для всех остальных сайтов (`*.ru`, Почта, YouTube, корпоративные ресурсы) PAC возвращает `DIRECT`. Учётные данные прокси хранятся локально в `~/Library/Application Support/AntigravityBypass/network/proxy.json` с правами `0600` и никогда не попадают в логи или отчёты диагностики (`[7]`).
+
+После обновления самого приложения Antigravity достаточно запустить `ag-bypass` и нажать **`1`** (сохранённый прокси при этом вводить заново не нужно).
 
 ---
 
-## Логи и диагностика
+## Сборка из исходников (для разработчиков)
 
-Файлы состояния и лог фоновой службы лежат в `/Library/Application Support/AntigravityBypass/`:
-- `watchdog.log` — журнал переключений маршрутов, срабатываний карантина и смены сетей;
-- `quarantine.json` — список временно отбракованных IP с причиной (`tcp_tls_dead`, `google_geo_RU`, `runtime_log:...`);
-- `known_good_ips.json` — кэш проверенных рабочих прокси-серверов;
-- `owned_routes_macos.json` — текущие прописанные статические маршруты `/32`.
-
-Посмотреть последние события фоновой службы:
 ```bash
-tail -f "/Library/Application Support/AntigravityBypass/watchdog.log"
+cargo build --release --locked
+./target/release/antigravity-bypass-russia
 ```
 
 ## Лицензия

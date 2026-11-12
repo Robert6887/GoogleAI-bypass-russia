@@ -477,6 +477,7 @@ pub fn collect() -> Value {
         "route_health": state.map(|s| s.diagnostic_snapshot(started)).unwrap_or_else(|_| unavailable("unreadable_or_invalid")),
         "recent_recovery": recent_events(&net::config::directory().join("network-events.log")),
         "previous_recovery": recent_events(&net::config::directory().join("network-events.previous.log")),
+        "proxy": net::local_proxy::summary(),
         "checks": checks
     })
 }

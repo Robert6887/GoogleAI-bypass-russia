@@ -29,6 +29,11 @@
 *.bin
 /antigravity-bypass-russia
 /ag_dns
+/ag
+/ag-bypass
+/ag.sh
+/ag-bypass.sh
+/unlock_and_restore.sh
 
 # --- Archives ---
 *.zip
