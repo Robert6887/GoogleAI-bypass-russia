@@ -470,8 +470,8 @@ pub fn path() -> PathBuf {
     super::config::directory().join("proxy.json")
 }
 
-pub fn load() -> Result<ProxyConfig, String> {
-    match fs::read(path()) {
+pub fn load_from_path(file: &std::path::Path) -> Result<ProxyConfig, String> {
+    match fs::read(file) {
         Ok(bytes) => {
             let config: ProxyConfig = serde_json::from_slice(&bytes).map_err(|_| {
                 "Файл настроек прокси повреждён; пароль в отчёт не включается".to_string()
@@ -482,6 +482,10 @@ pub fn load() -> Result<ProxyConfig, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ProxyConfig::default()),
         Err(error) => Err(format!("Не прочитать настройки прокси: {error}")),
     }
+}
+
+pub fn load() -> Result<ProxyConfig, String> {
+    load_from_path(&path())
 }
 
 pub fn save(config: &ProxyConfig) -> Result<(), String> {

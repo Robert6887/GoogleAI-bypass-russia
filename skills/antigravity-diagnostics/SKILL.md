@@ -21,8 +21,8 @@ Run the built-in JSON diagnostic check (no `sudo` required, safe allowlist, zero
 ### macOS
 Try the locally installed engine first; if absent, run directly from GitHub Releases:
 ```bash
-if [[ -x "$HOME/Library/Application Support/AntigravityBypass/network/antigravity-bypass-russia" ]]; then
-  "$HOME/Library/Application Support/AntigravityBypass/network/antigravity-bypass-russia" doctor --json
+if [[ -x "$HOME/Library/Application Support/AntigravityBypass/network/ag_proxy" ]]; then
+  "$HOME/Library/Application Support/AntigravityBypass/network/ag_proxy" doctor --json
 else
   curl -fsSL https://github.com/Robert6887/GoogleAI-bypass-russia/releases/latest/download/unlock_and_restore.sh | bash -s -- doctor --json
 fi
@@ -30,13 +30,13 @@ fi
 
 ### Windows (PowerShell)
 ```powershell
-$exe = "$env:LOCALAPPDATA\AntigravityBypass\network\antigravity-bypass-russia.exe"
+$exe = "$env:LOCALAPPDATA\AntigravityBypass\network\ag_proxy.exe"
 if (Test-Path $exe) { & $exe doctor --json }
 ```
 
 To also verify live latency and geo-eligibility across all 6 Google AI endpoints through the configured proxy:
 ```bash
-"$HOME/Library/Application Support/AntigravityBypass/network/antigravity-bypass-russia" proxy test
+"$HOME/Library/Application Support/AntigravityBypass/network/ag_proxy" proxy test
 ```
 
 ---
@@ -84,8 +84,11 @@ Check if any of these booleans is `true`:
 
 ### 5. Gemini Desktop, Gemini Web & Chrome «Ask Gemini»
 - `system_pac_active == false` (macOS):
-  - **Cause**: System PAC auto-routing (`/proxy.pac`) is disabled, so `Gemini.app` and browser tabs connect directly without the proxy.
-  - **Fix for user**: Run **`[1]`** and ensure `[c]` (`Gemini Web и Gemini Desktop`) is checked `[✓]`.
+  - **Cause**: System PAC auto-routing (`/proxy.pac`) is disabled, so browser tabs connect directly without the proxy.
+  - **Fix for user**: Run **`[1]`** and ensure `[c]` (`Gemini Web и Gemini Desktop`) is checked `[✓]`, then fully restart Chrome (`⌘Q`).
+- `gemini_sni_relay_active == false` (macOS, when using native `/Applications/Gemini.app`):
+  - **Cause**: Native macOS `Gemini.app` uses raw POSIX `GRPC2` sockets that bypass `.pac` and require our local loopback TLS SNI relay (`127.0.0.2:443`, LaunchDaemon `com.antigravity.bypass.sni`).
+  - **Fix for user**: Run **`[1]`** (which asks for macOS administrator password once to start `com.antigravity.bypass.sni` and update `/etc/hosts`), then restart `Gemini.app` (`⌘Q`).
 - `chrome_glic_unlocked == false`:
   - **Cause**: Chrome `Local State` still holds a restricted regional country code (`variations_country != "us"`) or `is_glic_eligible != true`, OR Chrome was open when unlocking ran.
   - **Fix for user**: Quit Google Chrome completely (`⌘Q`), run **`[1]`** (with `[d]` enabled), then reopen Chrome. Note: Google also requires a personal `@gmail.com` account (`18+`) in that Chrome profile; corporate Workspace accounts often disable GLIC by admin policy.

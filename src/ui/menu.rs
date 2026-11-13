@@ -465,6 +465,17 @@ pub fn handle_proxy_enable() -> bool {
         }
     }
 
+    if ok {
+        match clean_legacy_network(true) {
+            Ok(notes) => {
+                for note in notes {
+                    println!("  \x1b[92m✓\x1b[0m Очистка конфликтующих следов: {note}");
+                }
+            }
+            Err(error) => println!("  \x1b[93m!\x1b[0m Предупреждение очистки старых DNS: {error}"),
+        }
+    }
+
     #[cfg(target_os = "macos")]
     if ok {
         if config.products.needs_local_gateway() {
@@ -477,6 +488,11 @@ pub fn handle_proxy_enable() -> bool {
                     if config.products.needs_system_pac() && gemini_apps::pac_active() {
                         println!(
                             "  \x1b[92m✓\x1b[0m Системный PAC настроен для выбранных сервисов Gemini"
+                        );
+                    }
+                    if config.products.gemini_desktop && crate::net::sni_relay::listener_alive() {
+                        println!(
+                            "  \x1b[92m✓\x1b[0m Локальный SNI-шлюз Gemini.app активен (127.0.0.2:443)"
                         );
                     }
                     if config.products.gemini_desktop && gemini_apps::stop_gemini_desktop() {
@@ -492,17 +508,6 @@ pub fn handle_proxy_enable() -> bool {
             }
         } else {
             let _ = local_proxy::disable();
-        }
-    }
-
-    if ok {
-        match clean_legacy_network(true) {
-            Ok(notes) => {
-                for note in notes {
-                    println!("  \x1b[92m✓\x1b[0m Очистка конфликтующих следов: {note}");
-                }
-            }
-            Err(error) => println!("  \x1b[93m!\x1b[0m Предупреждение очистки старых DNS: {error}"),
         }
     }
 

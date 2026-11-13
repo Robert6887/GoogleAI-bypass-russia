@@ -80,8 +80,15 @@ pub fn print_dashboard() {
     status_row("Автопатч IDE:", autopatch_status);
 
     let desktop_installed = std::path::Path::new("/Applications/Gemini.app").exists();
-    let desktop_status = if listener_on && pac_on && cfg.products.gemini_desktop {
-        "\x1b[92mРазблокирован (системный PAC)\x1b[0m"
+    let sni_on = proxy["sni_relay"] == true;
+    let desktop_ready = listener_on
+        && pac_on
+        && cfg.products.gemini_desktop
+        && (sni_on || cfg.mode == proxy_config::Mode::Vpn);
+    let desktop_status = if desktop_ready {
+        "\x1b[92mРазблокирован (SNI-шлюз + PAC)\x1b[0m"
+    } else if listener_on && cfg.products.gemini_desktop {
+        "\x1b[93mНужно обновить шлюз в пункте [1]\x1b[0m"
     } else if desktop_installed {
         "\x1b[93mУстановлен (не включён в [1])\x1b[0m"
     } else {

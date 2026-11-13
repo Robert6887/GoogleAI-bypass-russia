@@ -301,6 +301,7 @@ fn gateway_summary() -> Value {
     json!({
         "status": "ok",
         "listener_alive": net::local_proxy::listener_alive(),
+        "sni_relay_alive": net::sni_relay::listener_alive(),
         "local_port": net::local_proxy::saved_port(),
         "autopatch_enabled": autopatch::is_enabled(),
         "installed_binary_sha256": installed,
@@ -429,7 +430,7 @@ pub fn build_ai_prompt(report: &Value) -> String {
 Контекст архитектуры утилиты GoogleAI-bypass-russia (v{}):\n\
 1. Antigravity IDE/CLI: бинарники должны иметь `patch_state: \"Patched\"` и `proxy_env_ready: true` (`AG_LS_PROXY`).\n\
 2. Локальный шлюз (`gateway.listener_alive: true`): принимает трафик на `127.0.0.1:<port>` и отправляет в зарубежный SOCKS5/HTTP прокси пользователя (`proxy.upstream_configured: true`).\n\
-3. Gemini Desktop и Gemini Web: работают через системный PAC (`legacy_conflicts.system_pac_active: true`). Если `hosts_has_gate_overrides`, `resolver_has_gate_files`, `legacy_daemon_present` или `proxy_bypass_blocks_google` равны `true`, старый сторонний обходчик мешает трафику.\n\
+3. Gemini Web и «Спросить Gemini» работают через системный PAC (`legacy_conflicts.system_pac_active: true`), а нативный Gemini Desktop (`Gemini.app`) — через локальный прозрачный SNI-шлюз `127.0.0.2:443` (`gateway.sni_relay_alive: true`). Если `hosts_has_gate_overrides`, `resolver_has_gate_files`, `legacy_daemon_present` или `proxy_bypass_blocks_google` равны `true`, старый сторонний обходчик мешает трафику.\n\
 4. Кнопка «Спросить Gemini» в Chrome: требует `chrome_glic_unlocked: true` (при закрытом Chrome) и личного аккаунта `@gmail.com`.\n\
 5. Как запустить меню утилиты одной командой в Терминале macOS:\n\
    `curl -fsSL https://github.com/Robert6887/GoogleAI-bypass-russia/releases/latest/download/unlock_and_restore.sh | bash`\n\

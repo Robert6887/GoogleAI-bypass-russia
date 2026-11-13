@@ -74,6 +74,8 @@ impl MockTlsServer {
             let _ = listener.set_nonblocking(true);
             while running_clone.load(Ordering::Relaxed) {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
                     let mut buf = [0u8; 1024];
                     if let Ok(n) = stream.read(&mut buf) {
                         if n >= 5 && buf[0] == 0x16 {
@@ -111,6 +113,8 @@ impl MockTlsServer {
             let _ = listener.set_nonblocking(true);
             while running_clone.load(Ordering::Relaxed) {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
                     // Send HTTP 200 OK header
                     let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
                     let _ = stream.write_all(header);

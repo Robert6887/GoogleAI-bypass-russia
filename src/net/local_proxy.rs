@@ -26,14 +26,27 @@ const TEST_BUDGET: Duration = Duration::from_secs(12);
 pub const ANTIGRAVITY_DOMAINS: &[&str] = &[
     "cloudcode-pa.googleapis.com",
     "daily-cloudcode-pa.googleapis.com",
+    "autopush-cloudcode-pa.sandbox.googleapis.com",
     "aicode.googleapis.com",
 ];
 
 pub const GEMINI_SHARED_AUTH_DOMAINS: &[&str] = &[
     "gemini.google.com",
+    "gemini.gstatic.com",
+    "gemini.app.google",
     "ogs.google.com",
+    "geminiweb-pa.clients6.google.com",
+    "push.clients6.google.com",
+    "ogads-pa.clients6.google.com",
+    "ogads-pa.googleapis.com",
+    "signaler-pa.clients6.google.com",
+    "signaler-pa.googleapis.com",
     "scone-pa.clients6.google.com",
+    "scone-pa.googleapis.com",
     "waa-pa.clients6.google.com",
+    "waa-pa.googleapis.com",
+    "proactivebackend-pa.clients6.google.com",
+    "peoplestack-pa.clients6.google.com",
 ];
 
 pub const GEMINI_WEB_DOMAINS: &[&str] = &[
@@ -45,9 +58,17 @@ pub const GEMINI_WEB_DOMAINS: &[&str] = &[
     "alkalicore-pa.clients6.google.com",
     "webchannel-alkalimakersuite-pa.clients6.google.com",
     "gemini.google.com",
+    "gemini.gstatic.com",
+    "gemini.app.google",
+    "geminiweb-pa.clients6.google.com",
+    "push.clients6.google.com",
+    "ogads-pa.clients6.google.com",
+    "signaler-pa.clients6.google.com",
     "bard.google.com",
     "notebooklm.google.com",
     "notebooklm.google",
+    "notebooklm-pa.googleapis.com",
+    "notebooklm-pa.clients6.google.com",
     "jules.google.com",
     "labs.google",
     "aisandbox-pa.googleapis.com",
@@ -55,11 +76,15 @@ pub const GEMINI_WEB_DOMAINS: &[&str] = &[
     "ogs.google.com",
     "scone-pa.clients6.google.com",
     "waa-pa.clients6.google.com",
+    "content.googleapis.com",
 ];
 
 pub const GEMINI_DESKTOP_DOMAINS: &[&str] = &[
     "robinfrontend-pa.googleapis.com",
+    "robinfrontend-pa.mtls.googleapis.com",
     "webchannel-robinfrontend-pa.googleapis.com",
+    "webchannel-robinfrontend-pa.mtls.googleapis.com",
+    "preprod-robinfrontend-pa.googleapis.com",
     "proactivebackend-pa.googleapis.com",
     "geller-pa.googleapis.com",
     "signaler-pa.googleapis.com",
@@ -68,23 +93,32 @@ pub const GEMINI_DESKTOP_DOMAINS: &[&str] = &[
     "notifications-pa.googleapis.com",
     "notifications-ueeshp-pa.googleapis.com",
     "feedback-pa.googleapis.com",
+    "feedback-pa.mtls.googleapis.com",
     "directpath-pa.googleapis.com",
+    "photospicker.googleapis.com",
+    "push.clients6.google.com",
 ];
 
 pub const CHROME_GEMINI_DOMAINS: &[&str] = &[
+    "geminiweb-pa.clients6.google.com",
     "geminiweb-pa.googleapis.com",
     "aratea-pa.googleapis.com",
+    "aratea-pa.clients6.google.com",
     "optimizationguide-pa.googleapis.com",
+    "optimizationguide-pa.clients6.google.com",
     "accountcapabilities-pa.googleapis.com",
     "clientservices.googleapis.com",
     "lensfrontend-pa.googleapis.com",
     "lensfrontend-pa.clients6.google.com",
+    "push.clients6.google.com",
+    "signaler-pa.clients6.google.com",
 ];
 
 /// Complete union of Google AI / Gemini gate hosts eligible for proxying.
 pub const GATE_DOMAINS: &[&str] = &[
     "cloudcode-pa.googleapis.com",
     "daily-cloudcode-pa.googleapis.com",
+    "autopush-cloudcode-pa.sandbox.googleapis.com",
     "aicode.googleapis.com",
     "generativelanguage.googleapis.com",
     "aistudio.google.com",
@@ -94,18 +128,35 @@ pub const GATE_DOMAINS: &[&str] = &[
     "alkalicore-pa.clients6.google.com",
     "webchannel-alkalimakersuite-pa.clients6.google.com",
     "gemini.google.com",
+    "gemini.gstatic.com",
+    "gemini.app.google",
+    "geminiweb-pa.clients6.google.com",
+    "push.clients6.google.com",
+    "ogads-pa.clients6.google.com",
+    "ogads-pa.googleapis.com",
+    "signaler-pa.clients6.google.com",
     "bard.google.com",
     "notebooklm.google.com",
     "notebooklm.google",
+    "notebooklm-pa.googleapis.com",
+    "notebooklm-pa.clients6.google.com",
     "jules.google.com",
     "labs.google",
     "aisandbox-pa.googleapis.com",
     "deepmind.google",
     "ogs.google.com",
     "scone-pa.clients6.google.com",
+    "scone-pa.googleapis.com",
     "waa-pa.clients6.google.com",
+    "waa-pa.googleapis.com",
+    "proactivebackend-pa.clients6.google.com",
+    "peoplestack-pa.clients6.google.com",
+    "content.googleapis.com",
     "robinfrontend-pa.googleapis.com",
+    "robinfrontend-pa.mtls.googleapis.com",
     "webchannel-robinfrontend-pa.googleapis.com",
+    "webchannel-robinfrontend-pa.mtls.googleapis.com",
+    "preprod-robinfrontend-pa.googleapis.com",
     "proactivebackend-pa.googleapis.com",
     "geller-pa.googleapis.com",
     "signaler-pa.googleapis.com",
@@ -114,10 +165,14 @@ pub const GATE_DOMAINS: &[&str] = &[
     "notifications-pa.googleapis.com",
     "notifications-ueeshp-pa.googleapis.com",
     "feedback-pa.googleapis.com",
+    "feedback-pa.mtls.googleapis.com",
     "directpath-pa.googleapis.com",
+    "photospicker.googleapis.com",
     "geminiweb-pa.googleapis.com",
     "aratea-pa.googleapis.com",
+    "aratea-pa.clients6.google.com",
     "optimizationguide-pa.googleapis.com",
+    "optimizationguide-pa.clients6.google.com",
     "accountcapabilities-pa.googleapis.com",
     "clientservices.googleapis.com",
     "lensfrontend-pa.googleapis.com",
@@ -736,13 +791,30 @@ pub fn detect_protocol(
     )
 }
 
+pub(crate) fn open_upstream_gate(
+    host: &str,
+    port: u16,
+    config: &ProxyConfig,
+) -> Result<TcpStream, String> {
+    if !is_gate_host(host) {
+        return Err("Целевой домен не входит в список Google AI".into());
+    }
+    let upstream = config
+        .upstream
+        .as_ref()
+        .ok_or_else(|| "Не указан внешний прокси для SNI-шлюза".to_string())?;
+    open_upstream(upstream, host, port, config.vpn_policy, CONNECT_BUDGET)
+}
+
 fn open_route(host: &str, port: u16, config: &ProxyConfig) -> Result<TcpStream, String> {
     if !is_gate_host(host) || config.mode == Mode::Vpn {
+        // Non-gate destinations and explicit system-VPN mode must honour the OS routing
+        // table (including split-tunnel corporate routes) rather than binding to en*.
         return connect_addresses(
             host,
             port,
             Instant::now() + CONNECT_BUDGET,
-            config.vpn_policy,
+            VpnPolicy::Use,
         );
     }
     match (&config.mode, &config.upstream) {
@@ -778,7 +850,7 @@ fn pump(mut from: TcpStream, mut to: TcpStream) {
     let _ = to.shutdown(Shutdown::Write);
 }
 
-fn tunnel(client: TcpStream, upstream: TcpStream) {
+pub(crate) fn tunnel(client: TcpStream, upstream: TcpStream) {
     let _ = super::socket::configure_tcp_stream(&client);
     let _ = super::socket::configure_tcp_stream(&upstream);
     let _ = client.set_read_timeout(None);
@@ -886,7 +958,11 @@ pub fn url_at(port: u16) -> String {
 }
 
 pub fn pac_url_at(port: u16) -> String {
-    format!("http://{}:{port}/proxy.pac", Ipv4Addr::LOCALHOST)
+    format!(
+        "http://{}:{port}/proxy.pac?v={}",
+        Ipv4Addr::LOCALHOST,
+        super::config::now_ms()
+    )
 }
 
 fn save_port(port: u16) -> Result<(), String> {
@@ -1095,7 +1171,7 @@ pub fn check_all_products(upstream: Option<&Upstream>, policy: VpnPolicy) -> Vec
         ("Gemini в браузере", "gemini.google.com", "/app", true),
         ("Google AI Studio", "aistudio.google.com", "/", true),
         ("Gemini Desktop", "robinfrontend-pa.googleapis.com", "/", false),
-        ("«Спросить Gemini» в Chrome", "geminiweb-pa.googleapis.com", "/", false),
+        ("«Спросить Gemini» в Chrome", "geminiweb-pa.clients6.google.com", "/", false),
     ];
     thread::scope(|scope| {
         let handles: Vec<_> = TARGETS
@@ -1361,6 +1437,11 @@ pub fn enable() -> Result<u16, String> {
                     } else {
                         let _ = super::gemini_apps::disable_system_pac();
                     }
+                    if config.products.gemini_desktop && config.mode != Mode::Vpn {
+                        super::sni_relay::enable()?;
+                    } else {
+                        let _ = super::sni_relay::disable();
+                    }
                     return Ok(port);
                 }
             }
@@ -1379,6 +1460,9 @@ pub fn disable() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         let mut errors = Vec::new();
+        if let Err(error) = super::sni_relay::disable() {
+            errors.push(error);
+        }
         let plist = agent_path();
         if plist.exists() && !crate::system::journal::has_record(&plist) {
             errors.push(format!(
@@ -1435,6 +1519,7 @@ pub fn summary() -> serde_json::Value {
         "products": config.as_ref().ok().map(|c| c.products),
         "local_port": saved_port(),
         "listener": listener_alive(),
+        "sni_relay": super::sni_relay::listener_alive(),
         "pac_enabled": super::gemini_apps::pac_active(),
         "credentials": "omitted",
     })

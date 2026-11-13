@@ -8,6 +8,7 @@ pub mod hosts;
 pub mod local_proxy;
 pub mod proxy_config;
 pub mod proxy_session;
+pub mod sni_relay;
 pub mod socket;
 
 use std::fs;

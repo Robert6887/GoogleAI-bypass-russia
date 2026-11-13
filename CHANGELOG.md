@@ -7,6 +7,19 @@
 
 ---
 
+## [2.7.2] - 2026-11-13
+
+### Исправлено и добавлено
+- **Исправлена ошибка `Что-то пошло не так. (1)` в Gemini Web и боковой панели «Спросить Gemini» в Chrome**:
+  - В локальный шлюз и `/proxy.pac` добавлены актуальные RPC-домены чата `geminiweb-pa.clients6.google.com`, `push.clients6.google.com`, `ogads-pa.clients6.google.com`, `signaler-pa.clients6.google.com`, `proactivebackend-pa.clients6.google.com`, `peoplestack-pa.clients6.google.com`, `aratea-pa.clients6.google.com`, `optimizationguide-pa.clients6.google.com`, `notebooklm-pa.clients6.google.com`, `gemini.gstatic.com`, `gemini.app.google` и сопутствующие `googleapis.com` шлюзы.
+  - В системный URL автонастройки прокси (`/proxy.pac?v=...`) добавлен параметр сброса кэша, чтобы macOS и открытый Chrome сразу подхватывали обновлённые правила маршрутизации без перезагрузки системы.
+  - Обновлён детектор статуса разблокировки «Спросить Gemini» в Chrome для зарубежных прокси любых неподсанкционных регионов (`variations_country` после обновления Variations seed).
+- **Исправлено зависание и ошибка `FAILED_PRECONDITION` (`iRPC code=9`) в нативном macOS-приложении `Gemini.app` (Gemini Desktop)**:
+  - Добавлен локальный прозрачный TLS SNI-шлюз (`com.antigravity.bypass.sni` на изолированных loopback-адресах `127.0.0.2:443` и `[fd00:6765:6d69::2]:443` с немедленным сбросом привилегий `root` до непривилегированного пользователя), который перехватывает прямые POSIX gRPC-соединения `Gemini.app` (`GRPC2` / `robinfrontend-pa.googleapis.com`) и туннелирует сквозной TLS строго через личный SOCKS5/HTTP прокси пользователя без расшифровки трафика и сторонних серверов.
+  - При полном откате (`[4]`) демон `com.antigravity.bypass.sni`, loopback-алиасы на `lo0` и блок `# BEGIN ANTIGRAVITY-GEMINI-SNI` в `/etc/hosts` удаляются без следа.
+
+---
+
 ## [2.7.1] - 2026-11-13
 
 ### Добавлено и исправлено

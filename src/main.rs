@@ -104,6 +104,13 @@ fn main() {
         }
         return;
     }
+    if command == net::sni_relay::SNI_PROXY_FLAG {
+        if let Err(error) = net::sni_relay::run_from_args(&args[2..]) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     ui::init_terminal();
     if matches!(command, "-h" | "--help" | "help") {

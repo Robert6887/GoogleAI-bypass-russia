@@ -5,6 +5,10 @@ use std::path::{Path, PathBuf};
 
 const START_MARK: &str = "# BEGIN ANTIGRAVITY-BYPASS-RUSSIA";
 const END_MARK: &str = "# END ANTIGRAVITY-BYPASS-RUSSIA";
+const SNI_START_MARK: &str = "# BEGIN ANTIGRAVITY-GEMINI-SNI";
+const SNI_END_MARK: &str = "# END ANTIGRAVITY-GEMINI-SNI";
+pub const SNI_LOOPBACK_IPV4: &str = "127.0.0.2";
+pub const SNI_LOOPBACK_IPV6: &str = "fd00:6765:6d69::2";
 
 pub fn hosts_path() -> PathBuf {
     #[cfg(target_os = "windows")]
@@ -48,7 +52,64 @@ pub fn has_gate_overrides() -> bool {
     let Ok(text) = fs::read_to_string(p) else {
         return false;
     };
-    strip_legacy_entries(&text).is_ok_and(|stripped| stripped != text)
+    let check_text = if super::sni_relay::listener_alive() {
+        strip_marked_block(&text, SNI_START_MARK, SNI_END_MARK).unwrap_or_else(|_| text.clone())
+    } else {
+        text
+    };
+    strip_legacy_entries(&check_text).is_ok_and(|stripped| stripped != check_text)
+}
+
+pub fn render_gemini_sni_hosts(text: &str, sni_hosts: &[&str]) -> Result<String, String> {
+    let mut clean = strip_legacy_entries(text)?;
+    if !sni_hosts.is_empty() {
+        if !clean.is_empty() && !clean.ends_with('\n') {
+            clean.push('\n');
+        }
+        clean.push_str(SNI_START_MARK);
+        clean.push('\n');
+        for host in sni_hosts {
+            clean.push_str(SNI_LOOPBACK_IPV4);
+            clean.push(' ');
+            clean.push_str(host);
+            clean.push('\n');
+            clean.push_str(SNI_LOOPBACK_IPV6);
+            clean.push(' ');
+            clean.push_str(host);
+            clean.push('\n');
+        }
+        clean.push_str(SNI_END_MARK);
+        clean.push('\n');
+    }
+    Ok(clean)
+}
+
+pub fn apply_gemini_sni_hosts(sni_hosts: &[&str]) -> Result<(), String> {
+    let p = hosts_path();
+    let original = if p.exists() {
+        fs::read_to_string(&p).map_err(|e| format!("Чтение hosts: {e}"))?
+    } else {
+        String::new()
+    };
+    let updated = render_gemini_sni_hosts(&original, sni_hosts)?;
+    if updated != original {
+        safe_write_hosts(&p, original.as_bytes(), updated.as_bytes())?;
+    }
+    Ok(())
+}
+
+pub fn remove_gemini_sni_hosts() -> Result<bool, String> {
+    let p = hosts_path();
+    if !p.exists() {
+        return Ok(false);
+    }
+    let original = fs::read_to_string(&p).map_err(|e| format!("Чтение hosts: {e}"))?;
+    let updated = strip_marked_block(&original, SNI_START_MARK, SNI_END_MARK)?;
+    if updated == original {
+        return Ok(false);
+    }
+    safe_write_hosts(&p, original.as_bytes(), updated.as_bytes())?;
+    Ok(true)
 }
 
 pub(crate) fn is_legacy_or_gate_host(host: &str) -> bool {
@@ -66,7 +127,8 @@ pub(crate) fn is_legacy_or_gate_host(host: &str) -> bool {
 }
 
 pub fn strip_legacy_entries(text: &str) -> Result<String, String> {
-    let without_block = strip_block(text)?;
+    let without_legacy = strip_marked_block(text, START_MARK, END_MARK)?;
+    let without_block = strip_marked_block(&without_legacy, SNI_START_MARK, SNI_END_MARK)?;
     let mut result = String::with_capacity(without_block.len());
     for line in without_block.split_inclusive('\n') {
         let trimmed = line.trim();
@@ -101,18 +163,19 @@ fn is_gate_host_override(trimmed: &str) -> bool {
     !hosts.is_empty() && hosts.iter().all(|h| is_legacy_or_gate_host(h))
 }
 
-fn strip_block(text: &str) -> Result<String, String> {
+fn strip_marked_block(text: &str, start_mark: &str, end_mark: &str) -> Result<String, String> {
     let mut result = String::new();
     let mut in_block = false;
     for line in text.split_inclusive('\n') {
-        match line.trim() {
-            START_MARK if !in_block => in_block = true,
-            END_MARK if in_block => in_block = false,
-            START_MARK | END_MARK => {
-                return Err("Повреждены границы блока hosts; файл сохранён".into())
-            }
-            _ if !in_block => result.push_str(line),
-            _ => {}
+        let trimmed = line.trim();
+        if trimmed == start_mark && !in_block {
+            in_block = true;
+        } else if trimmed == end_mark && in_block {
+            in_block = false;
+        } else if trimmed == start_mark || trimmed == end_mark {
+            return Err("Повреждены границы блока hosts; файл сохранён".into());
+        } else if !in_block {
+            result.push_str(line);
         }
     }
     if in_block {
@@ -196,6 +259,12 @@ mod tests {
             "{START_MARK}\n83.220.169.155 cloudcode-pa.googleapis.com\n{END_MARK}\n{original}# AG-BYPASS-HAP: блок IPv6\n::1 daily-cloudcode-pa.googleapis.com\n::1 cloudcode-pa.googleapis.com\n::1 aicode.googleapis.com\n45.155.204.190 gemini.google.com robinfrontend-pa.googleapis.com\n193.233.112.67 makersuite.google.com\n"
         );
         assert_eq!(strip_legacy_entries(&polluted).unwrap(), original);
-        assert!(strip_block(&format!("{START_MARK}\nunterminated")).is_err());
+        assert!(strip_marked_block(&format!("{START_MARK}\nunterminated"), START_MARK, END_MARK).is_err());
+
+        let with_sni = render_gemini_sni_hosts(&polluted, &["robinfrontend-pa.googleapis.com"]).unwrap();
+        assert!(with_sni.contains("127.0.0.2 robinfrontend-pa.googleapis.com\n"));
+        assert!(with_sni.contains("fd00:6765:6d69::2 robinfrontend-pa.googleapis.com\n"));
+        assert!(!with_sni.contains("45.155.204.190"));
+        assert_eq!(strip_legacy_entries(&with_sni).unwrap(), original);
     }
 }

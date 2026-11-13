@@ -25,8 +25,8 @@ fn pac_backup_path() -> PathBuf {
 }
 
 pub fn is_managed_pac_url(url: &str) -> bool {
-    url.trim()
-        .strip_prefix("http://127.0.0.1:")
+    let base = url.trim().split('?').next().unwrap_or("");
+    base.strip_prefix("http://127.0.0.1:")
         .and_then(|rest| rest.strip_suffix("/proxy.pac"))
         .and_then(|port| port.parse::<u16>().ok())
         .is_some_and(|port| port != 0)
@@ -598,20 +598,29 @@ const CHROME_COUNTRY_KEYS: [&str; 4] = [
     "variations_safe_seed_session_consistency_country",
 ];
 
+fn is_glic_blocked_country(code: &str) -> bool {
+    matches!(
+        code.trim().to_ascii_lowercase().as_str(),
+        "" | "ru" | "by" | "cn" | "hk" | "mo" | "ir" | "kp" | "cu" | "sy"
+    )
+}
+
 pub fn state_needs_glic_unlock(root: &serde_json::Value) -> bool {
     let Some(obj) = root.as_object() else {
         return false;
     };
-    if obj.get("variations_country").and_then(|v| v.as_str()) != Some("us") {
+    let Some(country) = obj.get("variations_country").and_then(|v| v.as_str()) else {
+        return true;
+    };
+    if is_glic_blocked_country(country) {
         return true;
     }
-    if let Some(arr) = obj
+    match obj
         .get("variations_permanent_consistency_country")
         .and_then(|v| v.as_array())
     {
-        if arr.last().and_then(|v| v.as_str()) != Some("us") {
-            return true;
-        }
+        Some(arr) if arr.last().and_then(|v| v.as_str()) == Some("us") => {}
+        _ => return true,
     }
     if let Some(cache) = obj
         .get("profile")
@@ -916,6 +925,9 @@ An asterisk (*) denotes that a network service is disabled.
             (Some("http://127.0.0.1:53129/proxy.pac".into()), true)
         );
         assert!(is_managed_pac_url("http://127.0.0.1:53129/proxy.pac"));
+        assert!(is_managed_pac_url(
+            "http://127.0.0.1:53129/proxy.pac?v=1794560000"
+        ));
         assert!(!is_managed_pac_url("http://corp.example/proxy.pac"));
         assert!(!is_managed_pac_url("http://127.0.0.1:0/proxy.pac"));
     }
@@ -940,6 +952,13 @@ An asterisk (*) denotes that a network service is disabled.
         let mut backup = ChromeGlicBackup::default();
         assert_eq!(patch_local_state_json(&mut state, &mut backup).unwrap(), 2);
         assert!(!state_needs_glic_unlock(&state));
+        // When Chrome refreshes Variations via a supported foreign proxy (e.g., TR/DE),
+        // session country updates while permanent consistency stays "us" and GLIC remains unlocked.
+        state["variations_country"] = serde_json::json!("tr");
+        assert!(!state_needs_glic_unlock(&state));
+        state["variations_country"] = serde_json::json!("ru");
+        assert!(state_needs_glic_unlock(&state));
+        state["variations_country"] = serde_json::json!("us");
         assert_eq!(state["variations_country"], "us");
         assert_eq!(
             state["variations_permanent_consistency_country"],
