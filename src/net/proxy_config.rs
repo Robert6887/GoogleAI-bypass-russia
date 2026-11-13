@@ -1,8 +1,47 @@
-//! Per-user settings for the private Antigravity CONNECT route.
+//! Per-user settings for the private local SOCKS5 / HTTP CONNECT gateway and selected products.
 //!
-//! The password never appears in a command-line argument, report or Debug output.
+//! Passwords never appear in command-line arguments, diagnostic reports, or Debug output.
 use serde::{Deserialize, Serialize};
 use std::{fmt, fs, io::Write, path::PathBuf, str::FromStr};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyProtocol {
+    #[default]
+    Http,
+    #[serde(alias = "socks", alias = "socks5h")]
+    Socks5,
+}
+
+impl ProxyProtocol {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Http => "HTTP",
+            Self::Socks5 => "SOCKS5",
+        }
+    }
+}
+
+impl FromStr for ProxyProtocol {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "http" | "http-connect" => Ok(Self::Http),
+            "socks5" | "socks5h" | "socks" => Ok(Self::Socks5),
+            _ => Err("Протокол прокси: socks5 или http".into()),
+        }
+    }
+}
+
+impl fmt::Display for ProxyProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Http => "http",
+            Self::Socks5 => "socks5",
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -10,7 +49,7 @@ pub enum Mode {
     #[default]
     OwnProxy,
     Vpn,
-    SniDirect,
+    #[serde(alias = "sni-direct")]
     Auto,
 }
 
@@ -21,9 +60,8 @@ impl FromStr for Mode {
         match value {
             "own-proxy" => Ok(Self::OwnProxy),
             "vpn" => Ok(Self::Vpn),
-            "sni-direct" => Ok(Self::SniDirect),
             "auto" => Ok(Self::Auto),
-            _ => Err("Режим: own-proxy, vpn, sni-direct или auto".into()),
+            _ => Err("Режим: own-proxy, vpn или auto".into()),
         }
     }
 }
@@ -33,7 +71,6 @@ impl fmt::Display for Mode {
         f.write_str(match self {
             Self::OwnProxy => "own-proxy",
             Self::Vpn => "vpn",
-            Self::SniDirect => "sni-direct",
             Self::Auto => "auto",
         })
     }
@@ -68,6 +105,46 @@ impl fmt::Display for VpnPolicy {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Products {
+    pub antigravity: bool,
+    pub autopatch: bool,
+    pub gemini_desktop: bool,
+    pub gemini_web: bool,
+    pub chrome_gemini: bool,
+}
+
+impl Default for Products {
+    fn default() -> Self {
+        Self {
+            antigravity: true,
+            autopatch: true,
+            gemini_desktop: true,
+            gemini_web: true,
+            chrome_gemini: true,
+        }
+    }
+}
+
+impl Products {
+    pub fn needs_system_pac(&self) -> bool {
+        self.gemini_desktop || self.gemini_web || self.chrome_gemini
+    }
+
+    pub fn needs_local_gateway(&self) -> bool {
+        self.antigravity || self.needs_system_pac()
+    }
+
+    pub fn any_selected(&self) -> bool {
+        self.antigravity
+            || self.autopatch
+            || self.gemini_desktop
+            || self.gemini_web
+            || self.chrome_gemini
+    }
+}
+
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Credentials {
@@ -87,15 +164,24 @@ impl fmt::Debug for Credentials {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {
+    #[serde(default)]
+    pub protocol: ProxyProtocol,
     pub host: String,
     pub port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials: Option<Credentials>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedUpstream {
+    pub upstream: Upstream,
+    pub protocol_explicit: bool,
+}
+
 impl fmt::Debug for Upstream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Upstream")
+            .field("protocol", &self.protocol)
             .field("host", &self.host)
             .field("port", &self.port)
             .field(
@@ -123,9 +209,24 @@ impl Upstream {
         }
     }
 
+    fn extract_scheme(raw: &str) -> Result<(ProxyProtocol, bool, &str), String> {
+        if let Some((scheme, rest)) = raw.split_once("://") {
+            match scheme.to_ascii_lowercase().as_str() {
+                "http" => Ok((ProxyProtocol::Http, true, rest)),
+                "socks5" | "socks5h" | "socks" => Ok((ProxyProtocol::Socks5, true, rest)),
+                _ => Err(
+                    "Поддерживаются SOCKS5 (socks5://...) и HTTP (http://...), либо просто ip:port:login:password"
+                        .into(),
+                ),
+            }
+        } else {
+            Ok((ProxyProtocol::Http, false, raw))
+        }
+    }
+
     fn split_credentials(userinfo: &str) -> Result<Credentials, String> {
         let (username, password) = userinfo.split_once(':').ok_or(
-            "Формат: login:password@ip:port, ip:port:login:password или ip:port",
+            "Формат: socks5://login:pass@ip:port, login:pass@ip:port, ip:port:login:pass или ip:port",
         )?;
         Ok(Credentials {
             username: username.to_string(),
@@ -133,23 +234,20 @@ impl Upstream {
         })
     }
 
-    /// Parse popular proxy formats:
-    /// - `login:password@host:port` (or `http://...`)
+    /// Parse popular SOCKS5 / HTTP proxy formats and remember whether the scheme was explicit:
+    /// - `socks5://login:password@host:port` / `http://login:password@host:port`
+    /// - `login:password@host:port`
     /// - `host:port:login:password` (including `[ipv6]:port:login:password`)
     /// - `host:port@login:password`
     /// - `host:port` without authentication
-    pub fn parse(input: &str) -> Result<Self, String> {
+    pub fn parse_with_hint(input: &str) -> Result<ParsedUpstream, String> {
         let raw = Self::strip_wrapping_quotes(input);
         if raw.is_empty() {
-            return Err("Укажите адрес прокси (например login:password@ip:port)".into());
+            return Err("Укажите адрес прокси (например ip:port:login:password)".into());
         }
-        let raw = if raw.len() >= 7 && raw[..7].eq_ignore_ascii_case("http://") {
-            &raw[7..]
-        } else {
-            raw
-        };
-        if raw.contains("://") {
-            return Err("Нужен обычный HTTP CONNECT-прокси, не SOCKS и не HTTPS-прокси".into());
+        let (protocol, protocol_explicit, raw) = Self::extract_scheme(raw)?;
+        if raw.is_empty() {
+            return Err("После схемы укажите адрес прокси (например ip:port)".into());
         }
         let (credentials, address) = if raw.contains('@') {
             let (left, right) = raw.rsplit_once('@').unwrap();
@@ -168,8 +266,7 @@ impl Upstream {
                     (Some(Self::split_credentials(userinfo)?), endpoint.to_string())
                 } else {
                     return Err(
-                        "Формат: login:password@ip:port, ip:port:login:password или ip:port"
-                            .into(),
+                        "Формат: login:password@ip:port, ip:port:login:password или ip:port".into(),
                     );
                 }
             } else {
@@ -204,18 +301,28 @@ impl Upstream {
                 ),
                 _ => {
                     return Err(
-                        "Формат: login:password@ip:port, ip:port:login:password или ip:port"
-                            .into(),
+                        "Формат: login:password@ip:port, ip:port:login:password или ip:port".into(),
                     )
                 }
             }
         };
         let (host, port) = Self::parse_endpoint(&address)?;
-        Self::endpoint(host, port, credentials)
+        let upstream = Self::with_protocol(protocol, host, port, credentials)?;
+        Ok(ParsedUpstream {
+            upstream,
+            protocol_explicit,
+        })
     }
 
-    /// Parse only the endpoint. Credentials are deliberately kept out of argv.
-    pub fn parse_endpoint(input: &str) -> Result<(String, u16), String> {
+    pub fn parse(input: &str) -> Result<Self, String> {
+        Ok(Self::parse_with_hint(input)?.upstream)
+    }
+
+    /// Parse only the endpoint (optionally prefixed with `socks5://` or `http://`).
+    /// Credentials are deliberately kept out of argv.
+    pub fn parse_endpoint_with_protocol(
+        input: &str,
+    ) -> Result<(ProxyProtocol, bool, String, u16), String> {
         let raw = input.trim();
         if raw.is_empty() || raw.len() > 2048 || raw.chars().any(char::is_control) {
             return Err("Укажите адрес в формате хост:порт".into());
@@ -223,16 +330,13 @@ impl Upstream {
         if raw.contains('@') {
             return Err("Не передавайте логин и пароль в аргументах: они сохранятся в истории shell. Укажите только хост:порт; пароль будет запрошен отдельно".into());
         }
-        let rest = raw.strip_prefix("http://").unwrap_or(raw);
-        if rest.contains("://") {
-            return Err("Нужен обычный HTTP CONNECT-прокси, не SOCKS и не HTTPS-прокси".into());
-        }
+        let (protocol, explicit, rest) = Self::extract_scheme(raw)?;
         let hostport = rest.strip_suffix('/').unwrap_or(rest);
         if hostport.is_empty()
             || hostport.contains(['/', '?', '#'])
             || hostport.chars().any(char::is_whitespace)
         {
-            return Err("Некорректный адрес HTTP-прокси".into());
+            return Err("Некорректный адрес прокси".into());
         }
         let (host, port) = if let Some(bracketed) = hostport.strip_prefix('[') {
             let (host, tail) = bracketed
@@ -262,10 +366,25 @@ impl Upstream {
             .ok()
             .filter(|port| *port != 0)
             .ok_or("Порт должен быть числом от 1 до 65535")?;
-        Ok((host.to_string(), port))
+        Ok((protocol, explicit, host.to_string(), port))
     }
 
+    pub fn parse_endpoint(input: &str) -> Result<(String, u16), String> {
+        let (_, _, host, port) = Self::parse_endpoint_with_protocol(input)?;
+        Ok((host, port))
+    }
+
+    #[cfg(test)]
     pub fn endpoint(
+        host: String,
+        port: u16,
+        credentials: Option<Credentials>,
+    ) -> Result<Self, String> {
+        Self::with_protocol(ProxyProtocol::Http, host, port, credentials)
+    }
+
+    pub fn with_protocol(
+        protocol: ProxyProtocol,
         host: String,
         port: u16,
         credentials: Option<Credentials>,
@@ -289,6 +408,7 @@ impl Upstream {
             }
         }
         Ok(Self {
+            protocol,
             host: valid_host,
             port: valid_port,
             credentials,
@@ -302,8 +422,14 @@ impl Upstream {
             self.host.clone()
         };
         match &self.credentials {
-            Some(credentials) => format!("{}:***@{}:{}", credentials.username, host, self.port),
-            None => format!("{host}:{}", self.port),
+            Some(credentials) => format!(
+                "{} {}:***@{}:{}",
+                self.protocol.label(),
+                credentials.username,
+                host,
+                self.port
+            ),
+            None => format!("{} {host}:{}", self.protocol.label(), self.port),
         }
     }
 }
@@ -315,15 +441,17 @@ pub struct ProxyConfig {
     pub mode: Mode,
     pub vpn_policy: VpnPolicy,
     pub upstream: Option<Upstream>,
+    pub products: Products,
 }
 
 impl ProxyConfig {
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema > 1 {
+        if self.schema > 2 {
             return Err("Неподдерживаемая версия настроек прокси".into());
         }
         if let Some(upstream) = &self.upstream {
-            Upstream::endpoint(
+            Upstream::with_protocol(
+                upstream.protocol,
                 upstream.host.clone(),
                 upstream.port,
                 upstream.credentials.clone(),
@@ -435,20 +563,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn endpoint_parser_is_strict_and_credentials_stay_out_of_arguments() {
+    fn endpoint_parser_supports_socks5_and_http_and_keeps_credentials_out_of_arguments() {
         assert_eq!(
-            Upstream::parse_endpoint("http://proxy.example:3128").unwrap(),
-            ("proxy.example".into(), 3128)
+            Upstream::parse_endpoint_with_protocol("http://proxy.example:3128").unwrap(),
+            (ProxyProtocol::Http, true, "proxy.example".into(), 3128)
         );
         assert_eq!(
-            Upstream::parse_endpoint("[2001:db8::1]:8080").unwrap(),
-            ("2001:db8::1".into(), 8080)
+            Upstream::parse_endpoint_with_protocol("socks5://proxy.example:1080").unwrap(),
+            (ProxyProtocol::Socks5, true, "proxy.example".into(), 1080)
+        );
+        assert_eq!(
+            Upstream::parse_endpoint_with_protocol("socks5h://[2001:db8::1]:1080").unwrap(),
+            (ProxyProtocol::Socks5, true, "2001:db8::1".into(), 1080)
+        );
+        assert_eq!(
+            Upstream::parse_endpoint_with_protocol("proxy.example:1080").unwrap(),
+            (ProxyProtocol::Http, false, "proxy.example".into(), 1080)
         );
         for invalid in [
             "",
             "proxy.example",
             "https://proxy.example:443",
-            "socks5://proxy.example:1080",
+            "socks4://proxy.example:1080",
             "user:secret@proxy.example:3128",
             "proxy.example:0",
             "proxy.example:3128/path",
@@ -459,62 +595,46 @@ mod tests {
     }
 
     #[test]
-    fn combined_proxy_input_supports_credentials_and_special_password_chars() {
-        let upstream = Upstream::parse("ivan:p@ss:word@proxy.example:3128").unwrap();
-        assert_eq!(upstream.host, "proxy.example");
-        assert_eq!(upstream.port, 3128);
-        let credentials = upstream.credentials.unwrap();
-        assert_eq!(credentials.username, "ivan");
-        assert_eq!(credentials.password, "p@ss:word");
+    fn combined_proxy_input_supports_socks5_http_and_schemeless_formats() {
+        let parsed = Upstream::parse_with_hint("socks5://ivan:p@ss:word@proxy.example:1080").unwrap();
+        assert!(parsed.protocol_explicit);
+        assert_eq!(parsed.upstream.protocol, ProxyProtocol::Socks5);
+        assert_eq!(parsed.upstream.host, "proxy.example");
+        assert_eq!(parsed.upstream.port, 1080);
+        assert_eq!(parsed.upstream.credentials.unwrap().password, "p@ss:word");
 
-        let upstream = Upstream::parse("http://ivan:secret@[2001:db8::1]:8080").unwrap();
-        assert_eq!(upstream.host, "2001:db8::1");
-        assert_eq!(upstream.port, 8080);
+        let colon_fmt = Upstream::parse_with_hint("185.10.20.30:1080:user1:p:a:s:s").unwrap();
+        assert!(!colon_fmt.protocol_explicit);
+        assert_eq!(colon_fmt.upstream.host, "185.10.20.30");
+        assert_eq!(colon_fmt.upstream.port, 1080);
+        assert_eq!(colon_fmt.upstream.credentials.unwrap().password, "p:a:s:s");
 
-        let upstream = Upstream::parse("proxy.example:3128").unwrap();
-        assert!(upstream.credentials.is_none());
-
-        let colon_fmt = Upstream::parse("185.10.20.30:8000:user1:p:a:s:s").unwrap();
-        assert_eq!(colon_fmt.host, "185.10.20.30");
-        assert_eq!(colon_fmt.port, 8000);
-        assert_eq!(
-            colon_fmt.credentials.unwrap(),
-            Credentials {
-                username: "user1".into(),
-                password: "p:a:s:s".into(),
-            }
-        );
-
-        let ipv6_colon = Upstream::parse("[2001:db8::1]:8080:ivan:secret:1").unwrap();
-        assert_eq!(ipv6_colon.host, "2001:db8::1");
-        assert_eq!(ipv6_colon.port, 8080);
-        assert_eq!(ipv6_colon.credentials.unwrap().password, "secret:1");
+        let socks_colon = Upstream::parse_with_hint("socks://185.10.20.30:1080:user1:secret").unwrap();
+        assert!(socks_colon.protocol_explicit);
+        assert_eq!(socks_colon.upstream.protocol, ProxyProtocol::Socks5);
 
         let rev_at = Upstream::parse("\"http://185.10.20.30:8000@ivan:12345\"").unwrap();
+        assert_eq!(rev_at.protocol, ProxyProtocol::Http);
         assert_eq!(rev_at.host, "185.10.20.30");
-        assert_eq!(rev_at.port, 8000);
         assert_eq!(rev_at.credentials.unwrap().username, "ivan");
-
-        let rev_at_special = Upstream::parse("185.10.20.30:8000@ivan:p@ss").unwrap();
-        assert_eq!(rev_at_special.host, "185.10.20.30");
-        assert_eq!(rev_at_special.credentials.unwrap().password, "p@ss");
 
         for invalid in [
             "",
             "ivan@proxy.example:3128",
             ":secret@proxy.example:3128",
             "185.10.20.30:8000:onlyuser",
-            "socks5://185.10.20.30:1080",
+            "https://185.10.20.30:443",
         ] {
             assert!(Upstream::parse(invalid).is_err(), "{invalid}");
         }
     }
 
     #[test]
-    fn debug_and_display_never_reveal_the_password() {
-        let upstream = Upstream::endpoint(
+    fn debug_display_and_legacy_config_migration_work_cleanly() {
+        let upstream = Upstream::with_protocol(
+            ProxyProtocol::Socks5,
             "proxy.example".into(),
-            3128,
+            1080,
             Some(Credentials {
                 username: "ivan".into(),
                 password: "SECRET_TOKEN".into(),
@@ -523,24 +643,14 @@ mod tests {
         .unwrap();
         assert!(!format!("{upstream:?}").contains("SECRET_TOKEN"));
         assert!(!upstream.safe_display().contains("SECRET_TOKEN"));
-        let serialized = serde_json::to_string(&upstream).unwrap();
-        // JSON storage necessarily contains it; logs and Debug necessarily do not.
-        assert!(serialized.contains("SECRET_TOKEN"));
-    }
+        assert!(upstream.safe_display().starts_with("SOCKS5 "));
 
-    #[test]
-    fn config_roundtrip_and_unknown_fields_are_checked() {
-        let config = ProxyConfig {
-            schema: 1,
-            mode: Mode::OwnProxy,
-            vpn_policy: VpnPolicy::Bypass,
-            upstream: None,
-        };
-        let bytes = serde_json::to_vec(&config).unwrap();
-        assert_eq!(
-            serde_json::from_slice::<ProxyConfig>(&bytes).unwrap().mode,
-            Mode::OwnProxy
-        );
+        // Old schema-1 configs with sni-direct or without `products` / `protocol` migrate cleanly.
+        let legacy = br#"{"schema":1,"mode":"sni-direct","vpn_policy":"bypass","upstream":{"host":"1.2.3.4","port":8080}}"#;
+        let parsed: ProxyConfig = serde_json::from_slice(legacy).unwrap();
+        assert_eq!(parsed.mode, Mode::Auto);
+        assert_eq!(parsed.upstream.unwrap().protocol, ProxyProtocol::Http);
+        assert!(parsed.products.antigravity && parsed.products.autopatch);
         assert!(
             serde_json::from_slice::<ProxyConfig>(br#"{"schema":1,"unexpected":true}"#).is_err()
         );

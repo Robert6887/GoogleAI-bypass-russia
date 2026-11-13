@@ -121,7 +121,7 @@ fn test_t4_04_live_benchmark_probing_7_relays_leader_selection() {
     let table = format_benchmark_table(&results);
 
     assert_eq!(results.len(), 7);
-    assert_eq!(results[0].ip, "83.220.169.155", "Comss Frankfurt 10G Anycast must be the leader");
+    assert_eq!(results[0].ip, "83.220.169.155", "SOCKS5 Frankfurt 10G must be the leader");
     assert!(table.contains("[✓ Лидер]"));
 }
 

@@ -1,10 +1,15 @@
-use super::route_health::{self, Key};
-use native_tls::{TlsConnector, TlsStream};
+use native_tls::TlsConnector;
+#[cfg(test)]
+use native_tls::TlsStream;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
-pub const PROBE_BUDGET: Duration = Duration::from_millis(2500);
+pub const AGENT_HOSTS: &[&str] = &[
+    "daily-cloudcode-pa.googleapis.com",
+    "cloudcode-pa.googleapis.com",
+    "aicode.googleapis.com",
+];
 
 /// The same certificate/HTTP probe is used by the resolver and the CONNECT proxy.
 /// The socket is consumed: the real client always receives a fresh, unmodified tunnel.
@@ -80,12 +85,6 @@ fn probe_with_connector(
     Err("HTTP header exceeds 64 KiB".into())
 }
 
-pub fn probe_ip(addr: SocketAddr, host: &str) -> Result<u128, String> {
-    let start = Instant::now();
-    probe_address(addr, host, start + PROBE_BUDGET)?;
-    Ok(start.elapsed().as_millis().max(1))
-}
-
 fn probe_address(addr: SocketAddr, host: &str, deadline: Instant) -> Result<u16, String> {
     let left = deadline
         .checked_duration_since(Instant::now())
@@ -95,26 +94,23 @@ fn probe_address(addr: SocketAddr, host: &str, deadline: Instant) -> Result<u16,
     probe_connected(stream, host, deadline)
 }
 
-pub fn check_ip(addr: SocketAddr, host: &str, refresh: bool) -> Result<u128, String> {
-    let key = Key::ip(host, addr);
-    let state = route_health::store().snapshot()?;
-    let now = route_health::now_ms();
-    if state.region_blocked(&key, now) {
-        return Err("Маршрут отложен после регионального отказа".into());
-    }
-    if state.blocked(&key, now) {
-        return Err("Маршрут ожидает повторной проверки".into());
-    }
-    if !refresh {
-        match state.cached(&key, now) {
-            Some(true) => return Ok(state.latency(&key).unwrap_or(1) as u128),
-            Some(false) => return Err("Маршрут ожидает повторной проверки".into()),
-            None => {}
-        }
-    }
-    let result = probe_ip(addr, host);
-    route_health::record(&key, result.as_ref().map(|ms| *ms).map_err(|_| ()))?;
-    result
+fn looks_google(ip: &IpAddr) -> bool {
+    let text = ip.to_string().to_ascii_lowercase();
+    [
+        "142.250.",
+        "142.251.",
+        "172.217.",
+        "172.253.",
+        "216.58.",
+        "74.125.",
+        "64.233.",
+        "108.177.",
+        "209.85.",
+        "2a00:1450:",
+        "2607:f8b0:",
+    ]
+    .iter()
+    .any(|prefix| text.starts_with(prefix))
 }
 
 #[derive(Debug, Default)]
@@ -130,6 +126,7 @@ pub struct ConnReport {
 }
 
 /// Complete TLS handshake with the OS trust store and hostname verification.
+#[cfg(test)]
 pub fn connect_tls(
     addr: SocketAddr,
     host: &str,
@@ -205,7 +202,7 @@ pub fn probe_host(host: &str) -> ConnReport {
                 report.latency_ms = start.elapsed().as_millis();
                 report.connected = Some(addr.to_string());
                 report.used_ipv6 = addr.is_ipv6();
-                report.looks_like_google = super::resolvers::looks_google(&addr.ip());
+                report.looks_like_google = looks_google(&addr.ip());
                 if status >= 500 {
                     report.error = Some(format!("HTTP {status}: сервер недоступен"));
                 }
@@ -216,23 +213,6 @@ pub fn probe_host(host: &str) -> ConnReport {
     }
     report.error = Some(last_error);
     report
-}
-
-pub fn probe_all() -> Vec<ConnReport> {
-    std::thread::scope(|scope| {
-        let jobs: Vec<_> = super::provider::NRPT_AGENT
-            .iter()
-            .map(|host| scope.spawn(move || probe_host(host)))
-            .collect();
-        jobs.into_iter()
-            .map(|j| {
-                j.join().unwrap_or_else(|_| ConnReport {
-                    error: Some("Проверка прервана".into()),
-                    ..Default::default()
-                })
-            })
-            .collect()
-    })
 }
 
 #[cfg(test)]

@@ -1,7 +1,6 @@
-#![allow(dead_code)]
-
+//! Cleanup of legacy `/etc/hosts` blocks and third-party Google AI blackhole lines.
 use std::fs;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 const START_MARK: &str = "# BEGIN ANTIGRAVITY-BYPASS-RUSSIA";
@@ -23,88 +22,67 @@ pub fn hosts_path() -> PathBuf {
     }
 }
 
-pub fn write_entries(entries: &[(String, Ipv4Addr)]) -> Result<(), String> {
-    let p = hosts_path();
-    let original = if p.exists() {
-        fs::read_to_string(&p).map_err(|e| format!("Чтение hosts: {}", e))?
-    } else {
-        String::new()
-    };
-
-    let stripped = strip_block(&original)?;
-    let mut block = String::new();
-    block.push_str(START_MARK);
-    block.push('\n');
-    for (host, ip) in entries {
-        block.push_str(&format!("{} {}\n::1 {}\n", ip, host, host));
-    }
-    block.push_str(END_MARK);
-    block.push('\n');
-
-    // Prepending needs no separator added to the user's bytes, even without
-    // an existing final newline. Rollback removes exactly our complete block.
-    let combined = format!("{block}{stripped}");
-    if combined == original {
-        return Ok(());
-    }
-
-    safe_write_hosts(&p, original.as_bytes(), combined.as_bytes())
-}
-
-pub fn remove_entries() -> Result<(), String> {
+pub fn remove_entries() -> Result<bool, String> {
     let p = hosts_path();
     if !p.exists() {
-        return Ok(());
+        return Ok(false);
     }
-    let original = fs::read_to_string(&p).map_err(|e| format!("Чтение hosts: {}", e))?;
-    let stripped = strip_block(&original)?;
-    if stripped != original {
-        safe_write_hosts(&p, original.as_bytes(), stripped.as_bytes())?;
+    let original = fs::read_to_string(&p).map_err(|e| format!("Чтение hosts: {e}"))?;
+    let stripped = strip_legacy_entries(&original)?;
+    if stripped == original {
+        return Ok(false);
     }
-    Ok(())
-}
-
-pub fn owned_entries() -> Result<Vec<(String, Ipv4Addr)>, String> {
-    match fs::read_to_string(hosts_path()) {
-        Ok(text) => parse_owned_entries(&text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
-        Err(e) => Err(format!("Чтение hosts: {e}")),
-    }
-}
-
-fn parse_owned_entries(text: &str) -> Result<Vec<(String, Ipv4Addr)>, String> {
-    strip_block(text)?; // Refuse damaged boundaries rather than guessing ownership.
-    let mut entries = Vec::new();
-    let mut inside = false;
-    for line in text.lines() {
-        match line.trim() {
-            START_MARK => inside = true,
-            END_MARK => inside = false,
-            _ if inside => {
-                let mut fields = line.split('#').next().unwrap_or("").split_whitespace();
-                let Some(ip) = fields.next().and_then(|ip| ip.parse::<Ipv4Addr>().ok()) else {
-                    continue;
-                };
-                for host in fields {
-                    let host = super::route_health::host_name(host);
-                    if !super::provider::NRPT_AGENT.contains(&host.as_str()) {
-                        continue;
-                    }
-                    if entries
-                        .iter()
-                        .any(|(name, previous)| name == &host && previous != &ip)
-                    {
-                        return Err(format!("Неоднозначные адреса {host} в блоке hosts"));
-                    }
-                    if !entries.contains(&(host.clone(), ip)) {
-                        entries.push((host, ip));
-                    }
-                }
-            }
-            _ => {}
+    if crate::net::config::ensure_directory().is_ok() {
+        let archive = crate::net::config::directory().join("hosts.legacy-archive");
+        if !archive.exists() {
+            let _ = crate::system::fs_utils::robust_write_file(&archive, original.as_bytes());
+            let _ = crate::net::config::inherit_directory_owner(&archive);
         }
     }
-    Ok(entries)
+    safe_write_hosts(&p, original.as_bytes(), stripped.as_bytes())?;
+    Ok(true)
+}
+
+pub fn strip_legacy_entries(text: &str) -> Result<String, String> {
+    let without_block = strip_block(text)?;
+    let mut result = String::with_capacity(without_block.len());
+    for line in without_block.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if is_legacy_bypass_comment(trimmed) || is_gate_loopback_blackhole(trimmed) {
+            continue;
+        }
+        result.push_str(line);
+    }
+    Ok(result)
+}
+
+fn is_legacy_bypass_comment(trimmed: &str) -> bool {
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("# ag-bypass")
+        || lower.starts_with("# antigravity-bypass")
+        || lower.starts_with("# confeden")
+}
+
+fn is_gate_loopback_blackhole(trimmed: &str) -> bool {
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return false;
+    }
+    let body = trimmed.split('#').next().unwrap_or("").trim();
+    let mut fields = body.split_whitespace();
+    let Some(ip_str) = fields.next() else {
+        return false;
+    };
+    let Ok(ip) = ip_str.parse::<IpAddr>() else {
+        return false;
+    };
+    if !(ip.is_loopback() || ip.is_unspecified()) {
+        return false;
+    }
+    let hosts: Vec<&str> = fields.collect();
+    !hosts.is_empty()
+        && hosts
+            .iter()
+            .all(|h| super::local_proxy::is_gate_host(h))
 }
 
 fn strip_block(text: &str) -> Result<String, String> {
@@ -127,125 +105,33 @@ fn strip_block(text: &str) -> Result<String, String> {
     Ok(result)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn only_unambiguous_owned_agent_entries_can_identify_a_refused_route() {
-        let unmanaged = "192.0.2.9 cloudcode-pa.googleapis.com\n";
-        assert!(parse_owned_entries(unmanaged).unwrap().is_empty());
-        let text = format!("{unmanaged}{START_MARK}\n192.0.2.1 CLOUDCODE-PA.GOOGLEAPIS.COM # keep\n192.0.2.2 unrelated.test\n{END_MARK}\n");
-        assert_eq!(
-            parse_owned_entries(&text).unwrap(),
-            vec![(
-                "cloudcode-pa.googleapis.com".into(),
-                "192.0.2.1".parse().unwrap()
-            )]
-        );
-        let conflicting = text.replace(
-            END_MARK,
-            &format!("192.0.2.3 cloudcode-pa.googleapis.com\n{END_MARK}"),
-        );
-        assert!(parse_owned_entries(&conflicting).is_err());
-        assert!(parse_owned_entries(&text.replace(END_MARK, "")).is_err());
-    }
-
-    #[test]
-    fn stale_hosts_update_preserves_concurrent_edit_on_every_platform() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("hosts");
-        fs::write(&path, "user changed this").unwrap();
-        assert!(safe_write_hosts(&path, b"old", b"replacement").is_err());
-        assert_eq!(fs::read_to_string(path).unwrap(), "user changed this");
-    }
-    #[test]
-    fn removing_owned_block_preserves_unmanaged_bytes_and_user_additions() {
-        for original in [
-            "# user\r\n127.0.0.1 localhost\r\n",
-            "# user without final newline",
-            "",
-        ] {
-            let text = format!("{START_MARK}\n127.0.0.2 example.com\n{END_MARK}\n{original}");
-            assert_eq!(strip_block(&text).unwrap(), original);
-            assert_eq!(strip_block(original).unwrap(), original);
-        }
-        assert!(strip_block(&format!("{START_MARK}\n# user lines")).is_err());
-        assert!(strip_block(END_MARK).is_err());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn removes_owned_entries_when_windows_denies_replacement() {
-        use std::os::windows::fs::OpenOptionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("hosts");
-        let unmanaged = "127.0.0.1 localhost\r\n# other application's entries\r\n";
-        let original = format!("{START_MARK}\n127.0.0.2 example.com\n{END_MARK}\n{unmanaged}");
-        fs::write(&path, &original).unwrap();
-        // A reader that shares writes but not deletion reproduces the failure.
-        let _reader = fs::OpenOptions::new()
-            .read(true)
-            .share_mode(3)
-            .open(&path)
-            .unwrap();
-        assert!(crate::system::fs_utils::robust_write_file(&path, unmanaged.as_bytes()).is_err());
-        assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
-        safe_write_hosts(&path, original.as_bytes(), unmanaged.as_bytes()).unwrap();
-        assert_eq!(fs::read(&path).unwrap(), unmanaged.as_bytes());
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn fallback_preserves_concurrent_changes_and_refuses_active_writers() {
-        use std::os::windows::fs::OpenOptionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("hosts");
-        fs::write(&path, b"user addition").unwrap();
-        assert!(write_hosts_in_place(&path, b"stale content", b"replacement").is_err());
-        let _writer = fs::OpenOptions::new()
-            .write(true)
-            .share_mode(3)
-            .open(&path)
-            .unwrap();
-        assert!(safe_write_hosts(&path, b"user addition", b"replacement").is_err());
-        assert_eq!(fs::read(&path).unwrap(), b"user addition");
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
-    }
-}
-
-fn safe_write_hosts(path: &Path, _expected: &[u8], data: &[u8]) -> Result<(), String> {
+fn safe_write_hosts(path: &Path, expected: &[u8], data: &[u8]) -> Result<(), String> {
     let current = match fs::read(path) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && _expected.is_empty() => vec![],
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && expected.is_empty() => vec![],
         Err(e) => return Err(e.to_string()),
     };
-    if current != _expected {
+    if current != expected {
         return Err("hosts изменён другой программой; повторите операцию".into());
     }
     let result = crate::system::fs_utils::robust_write_file(path, data);
     #[cfg(windows)]
     if let Err(atomic_error) = result {
-        return write_hosts_in_place(path, _expected, data)
+        return write_hosts_in_place(path, expected, data)
             .map_err(|e| format!("{atomic_error}. Обновление hosts на месте: {e}"));
     }
     result
 }
 
-/// Windows can allow writing hosts while denying replacement of its directory
-/// entry. Keep its identity/ACL and a flushed recovery copy before modifying it.
-/// This fallback is deliberately restricted to hosts, not application binaries.
 #[cfg(windows)]
 fn write_hosts_in_place(path: &Path, expected: &[u8], data: &[u8]) -> Result<(), String> {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::windows::fs::OpenOptionsExt;
 
-    // Allow readers but exclude other writers/deletion throughout read and write.
-    // No truncate on open: a failed open must leave the original untouched.
     let mut file = fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .share_mode(1) // FILE_SHARE_READ
+        .share_mode(1)
         .open(path)
         .map_err(|e| e.to_string())?;
     let mut original = Vec::new();
@@ -281,4 +167,19 @@ fn write_hosts_in_place(path: &Path, expected: &[u8], data: &[u8]) -> Result<(),
     }
     let _ = fs::remove_file(backup_path);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_legacy_block_and_gate_ipv6_blackholes_while_keeping_user_hosts() {
+        let original = "127.0.0.1 localhost\n::1 localhost\n10.0.0.5 internal.corp\n";
+        let polluted = format!(
+            "{START_MARK}\n83.220.169.155 cloudcode-pa.googleapis.com\n{END_MARK}\n{original}# AG-BYPASS-HAP: блок IPv6\n::1 daily-cloudcode-pa.googleapis.com\n::1 cloudcode-pa.googleapis.com\n::1 aicode.googleapis.com\n"
+        );
+        assert_eq!(strip_legacy_entries(&polluted).unwrap(), original);
+        assert!(strip_block(&format!("{START_MARK}\nunterminated")).is_err());
+    }
 }

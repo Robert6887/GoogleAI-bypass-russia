@@ -32,10 +32,11 @@ pub fn is_managed_pac_url(url: &str) -> bool {
         .is_some_and(|port| port != 0)
 }
 
-/// Extract enabled physical (`en*`) macOS network services from
-/// `networksetup -listnetworkserviceorder`, skipping disabled (`*`) entries and
-/// virtual VPN/proxy services (FortiClient, Happ, NetBird) whose BSD device is empty.
-pub fn parse_hardware_services(order_text: &str) -> Vec<String> {
+/// Extract enabled macOS network services eligible for PAC auto-configuration from
+/// `networksetup -listnetworkserviceorder`: physical `en*` adapters and enabled
+/// virtual tunnel services (`Device:` empty), skipping disabled (`*`) entries and
+/// L2 bridge interfaces (`bridge*`).
+pub fn parse_pac_services(order_text: &str) -> Vec<String> {
     let mut services = Vec::new();
     let mut pending_service: Option<String> = None;
     for raw_line in order_text.lines() {
@@ -56,10 +57,11 @@ pub fn parse_hardware_services(order_text: &str) -> Vec<String> {
                         (pending_service.take(), line.rsplit_once("Device:"))
                     {
                         let dev = dev_part.trim_end_matches(')').trim();
-                        if dev.starts_with("en")
-                            && dev[2..].bytes().all(|b| b.is_ascii_digit())
+                        let is_physical_en = dev.starts_with("en")
                             && !dev[2..].is_empty()
-                        {
+                            && dev[2..].bytes().all(|b| b.is_ascii_digit());
+                        let is_tunnel_service = dev.is_empty();
+                        if is_physical_en || is_tunnel_service {
                             services.push(service);
                         }
                     }
@@ -124,9 +126,9 @@ pub fn enable_system_pac(pac_url: &str) -> Result<Vec<String>, String> {
         if !order.status.success() {
             return Err("Не удалось получить список сетевых служб macOS".into());
         }
-        let services = parse_hardware_services(&String::from_utf8_lossy(&order.stdout));
+        let services = parse_pac_services(&String::from_utf8_lossy(&order.stdout));
         if services.is_empty() {
-            return Err("Не найдена активная физическая сетевая служба macOS (Wi-Fi / Ethernet)".into());
+            return Err("Не найдена активная сетевая служба macOS для настройки PAC".into());
         }
         let mut backup = load_pac_backup()?.unwrap_or(PacBackup {
             schema: 1,
@@ -664,7 +666,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_only_enabled_physical_en_services_and_skips_vpns() {
+    fn parses_enabled_physical_and_tunnel_services_and_skips_bridges_and_disabled() {
         let sample = "\
 An asterisk (*) denotes that a network service is disabled.
 (1) Thunderbolt Bridge
@@ -676,13 +678,20 @@ An asterisk (*) denotes that a network service is disabled.
 (*) USB 10/100/1000 LAN
 (Hardware Port: USB 10/100/1000 LAN, Device: en5)
 
-(3) VPN
-(Hardware Port: com.fortinet.forticlient.macos.vpn, Device: )
+(3) Tunnel A
+(Hardware Port: com.example.packet-tunnel.a, Device: )
 
-(4) Happ
-(Hardware Port: su.ffg.happ, Device: )
+(4) Tunnel B
+(Hardware Port: org.example.packet-tunnel.b, Device: )
 ";
-        assert_eq!(parse_hardware_services(sample), vec!["Wi-Fi".to_string()]);
+        assert_eq!(
+            parse_pac_services(sample),
+            vec![
+                "Wi-Fi".to_string(),
+                "Tunnel A".to_string(),
+                "Tunnel B".to_string()
+            ]
+        );
     }
 
     #[test]

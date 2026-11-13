@@ -1,14 +1,14 @@
-//! Loopback CONNECT proxy and PAC server for Antigravity, Gemini Web, AI Studio,
+//! Loopback CONNECT gateway and PAC server for Antigravity, Gemini Web, AI Studio,
 //! native macOS Gemini.app, and Chrome built-in Gemini (GLIC).
 //!
-//! TLS remains end-to-end. Only Google AI / Gemini gate hosts use the user's
-//! upstream; all other requests stay direct.
-use super::proxy_config::{Mode, ProxyConfig, Upstream, VpnPolicy};
+//! Accepts local HTTP CONNECT from apps/OS and forwards Google AI / Gemini gate hosts
+//! through the user's SOCKS5 (remote DNS `socks5h`) or HTTP CONNECT proxy with end-to-end TLS.
+use super::proxy_config::{Mode, Products, ProxyConfig, ProxyProtocol, Upstream, VpnPolicy};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::{self, Read, Write},
-    net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::mpsc,
     thread,
@@ -21,15 +21,22 @@ pub const FALLBACK_PORTS: [u16; 6] = [43129, 44129, 45129, 46129, 47129, 48129];
 pub const AGENT_LABEL: &str = "com.antigravity.bypass.local-proxy";
 const MAX_HEAD: usize = 8 * 1024;
 const CONNECT_BUDGET: Duration = Duration::from_secs(8);
-const TEST_BUDGET: Duration = Duration::from_secs(15);
+const TEST_BUDGET: Duration = Duration::from_secs(12);
 
-/// Exact domains (and their subdomains) routed through the user's HTTP proxy.
-pub const GATE_DOMAINS: &[&str] = &[
-    // Antigravity IDE, CLI & Voice Input
+pub const ANTIGRAVITY_DOMAINS: &[&str] = &[
     "cloudcode-pa.googleapis.com",
     "daily-cloudcode-pa.googleapis.com",
     "aicode.googleapis.com",
-    // Gemini API & Google AI Studio
+];
+
+pub const GEMINI_SHARED_AUTH_DOMAINS: &[&str] = &[
+    "gemini.google.com",
+    "ogs.google.com",
+    "scone-pa.clients6.google.com",
+    "waa-pa.clients6.google.com",
+];
+
+pub const GEMINI_WEB_DOMAINS: &[&str] = &[
     "generativelanguage.googleapis.com",
     "aistudio.google.com",
     "ai.google.dev",
@@ -37,7 +44,6 @@ pub const GATE_DOMAINS: &[&str] = &[
     "alkalimakersuite-pa.clients6.google.com",
     "alkalicore-pa.clients6.google.com",
     "webchannel-alkalimakersuite-pa.clients6.google.com",
-    // Gemini Web, NotebookLM, Jules & Google Labs
     "gemini.google.com",
     "bard.google.com",
     "notebooklm.google.com",
@@ -49,7 +55,9 @@ pub const GATE_DOMAINS: &[&str] = &[
     "ogs.google.com",
     "scone-pa.clients6.google.com",
     "waa-pa.clients6.google.com",
-    // Gemini Desktop (/Applications/Gemini.app — Robin / Janus)
+];
+
+pub const GEMINI_DESKTOP_DOMAINS: &[&str] = &[
     "robinfrontend-pa.googleapis.com",
     "webchannel-robinfrontend-pa.googleapis.com",
     "proactivebackend-pa.googleapis.com",
@@ -61,7 +69,52 @@ pub const GATE_DOMAINS: &[&str] = &[
     "notifications-ueeshp-pa.googleapis.com",
     "feedback-pa.googleapis.com",
     "directpath-pa.googleapis.com",
-    // Chrome Built-in Gemini ("Ask Gemini" / GLIC & Lens AI)
+];
+
+pub const CHROME_GEMINI_DOMAINS: &[&str] = &[
+    "geminiweb-pa.googleapis.com",
+    "aratea-pa.googleapis.com",
+    "optimizationguide-pa.googleapis.com",
+    "accountcapabilities-pa.googleapis.com",
+    "clientservices.googleapis.com",
+    "lensfrontend-pa.googleapis.com",
+    "lensfrontend-pa.clients6.google.com",
+];
+
+/// Complete union of Google AI / Gemini gate hosts eligible for proxying.
+pub const GATE_DOMAINS: &[&str] = &[
+    "cloudcode-pa.googleapis.com",
+    "daily-cloudcode-pa.googleapis.com",
+    "aicode.googleapis.com",
+    "generativelanguage.googleapis.com",
+    "aistudio.google.com",
+    "ai.google.dev",
+    "makersuite.google.com",
+    "alkalimakersuite-pa.clients6.google.com",
+    "alkalicore-pa.clients6.google.com",
+    "webchannel-alkalimakersuite-pa.clients6.google.com",
+    "gemini.google.com",
+    "bard.google.com",
+    "notebooklm.google.com",
+    "notebooklm.google",
+    "jules.google.com",
+    "labs.google",
+    "aisandbox-pa.googleapis.com",
+    "deepmind.google",
+    "ogs.google.com",
+    "scone-pa.clients6.google.com",
+    "waa-pa.clients6.google.com",
+    "robinfrontend-pa.googleapis.com",
+    "webchannel-robinfrontend-pa.googleapis.com",
+    "proactivebackend-pa.googleapis.com",
+    "geller-pa.googleapis.com",
+    "signaler-pa.googleapis.com",
+    "speechs3proto2-pa.googleapis.com",
+    "accountlinking-pa.googleapis.com",
+    "notifications-pa.googleapis.com",
+    "notifications-ueeshp-pa.googleapis.com",
+    "feedback-pa.googleapis.com",
+    "directpath-pa.googleapis.com",
     "geminiweb-pa.googleapis.com",
     "aratea-pa.googleapis.com",
     "optimizationguide-pa.googleapis.com",
@@ -80,6 +133,33 @@ pub fn is_gate_host(host: &str) -> bool {
                 && lower.ends_with(domain)
                 && lower.as_bytes()[lower.len() - domain.len() - 1] == b'.')
     })
+}
+
+fn active_pac_domains(products: &Products) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    let mut push_unique = |slice: &[&'static str]| {
+        for &domain in slice {
+            if !out.contains(&domain) {
+                out.push(domain);
+            }
+        }
+    };
+    if products.antigravity {
+        push_unique(ANTIGRAVITY_DOMAINS);
+    }
+    if products.needs_system_pac() {
+        push_unique(GEMINI_SHARED_AUTH_DOMAINS);
+    }
+    if products.gemini_web {
+        push_unique(GEMINI_WEB_DOMAINS);
+    }
+    if products.gemini_desktop {
+        push_unique(GEMINI_DESKTOP_DOMAINS);
+    }
+    if products.chrome_gemini {
+        push_unique(CHROME_GEMINI_DOMAINS);
+    }
+    out
 }
 
 fn parse_pac_request(head: &[u8]) -> Option<bool> {
@@ -107,12 +187,13 @@ fn parse_pac_request(head: &[u8]) -> Option<bool> {
     (clean == "/proxy.pac").then_some(is_head)
 }
 
-pub fn pac_script(port: u16, mode: Mode) -> String {
-    if mode == Mode::SniDirect {
+pub fn pac_script_for_products(port: u16, products: &Products) -> String {
+    let domains = active_pac_domains(products);
+    if domains.is_empty() {
         return "function FindProxyForURL(url, host) { return \"DIRECT\"; }\n".into();
     }
     let mut list = String::new();
-    for (idx, domain) in GATE_DOMAINS.iter().enumerate() {
+    for (idx, domain) in domains.iter().enumerate() {
         if idx > 0 {
             list.push_str(",\n    ");
         }
@@ -230,18 +311,13 @@ fn resolve_within(host: &str, port: u16, deadline: Instant) -> Result<Vec<Socket
 }
 
 #[cfg(target_os = "macos")]
-fn physical_interface() -> Result<u32, String> {
-    super::egress::detect_physical()
-        .map(|(index, _)| index)
-        .ok_or_else(|| {
-            "Режим bypass-vpn: не найден физический интерфейс; соединение не отправлено через VPN"
-                .into()
-        })
+fn physical_interface() -> Option<u32> {
+    super::egress::detect_physical().map(|(index, _)| index)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn physical_interface() -> Result<u32, String> {
-    Err("Режим bypass-vpn сейчас поддерживается только на macOS".into())
+fn physical_interface() -> Option<u32> {
+    None
 }
 
 #[cfg(target_os = "macos")]
@@ -379,28 +455,43 @@ fn connect_addresses(
     policy: VpnPolicy,
 ) -> Result<TcpStream, String> {
     let interface = if policy == VpnPolicy::Bypass {
-        Some(physical_interface()?)
+        physical_interface()
     } else {
         None
     };
     let addresses = resolve_within(host, port, deadline)?;
+    // Pass 1: when physical-first (`Bypass`) is enabled, try binding directly to
+    // the hardware NIC (`en*`) for non-loopback targets so active L3 `utun` tunnels
+    // cannot hijack or double-encapsulate proxy traffic. Loopback (`127.0.0.1` / `::1`,
+    // e.g. a local SOCKS5/HTTP core on this machine) skips hardware binding immediately.
+    if let Some(if_index) = interface {
+        for address in &addresses {
+            if address.ip().is_loopback() {
+                continue;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let bound_budget = left.min(Duration::from_millis(2500));
+            #[cfg(target_os = "macos")]
+            if let Ok(stream) = connect_bound(*address, bound_budget, if_index) {
+                let _ = stream.set_nodelay(true);
+                return Ok(stream);
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (address, bound_budget, if_index);
+        }
+    }
+    // Pass 2: standard OS-routed connect (used directly for loopback upstreams,
+    // `VpnPolicy::Use`, or as automatic zero-config fallback when an active tunnel
+    // enables a kernel kill-switch such as `includeAllNetworks` / WFP that blocks `en0`).
     for address in addresses {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             break;
         }
-        #[cfg(target_os = "macos")]
-        let result = if let Some(interface) = interface {
-            connect_bound(address, left, interface)
-        } else {
-            TcpStream::connect_timeout(&address, left)
-        };
-        #[cfg(not(target_os = "macos"))]
-        let result = {
-            let _ = interface;
-            TcpStream::connect_timeout(&address, left)
-        };
-        if let Ok(stream) = result {
+        if let Ok(stream) = TcpStream::connect_timeout(&address, left) {
             let _ = stream.set_nodelay(true);
             return Ok(stream);
         }
@@ -408,7 +499,134 @@ fn connect_addresses(
     Err("TCP-соединение не установлено в отведённое время".into())
 }
 
-fn open_upstream(
+fn read_exact_until(stream: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> Result<(), String> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err("Превышено время ожидания ответа от прокси".into());
+    }
+    stream
+        .set_read_timeout(Some(left))
+        .map_err(|_| "Ошибка таймаута чтения сокета".to_string())?;
+    stream
+        .read_exact(buf)
+        .map_err(|_| "Прокси закрыл соединение или не ответил вовремя".to_string())
+}
+
+fn open_socks5(
+    upstream: &Upstream,
+    host: &str,
+    port: u16,
+    policy: VpnPolicy,
+    budget: Duration,
+) -> Result<TcpStream, String> {
+    let deadline = Instant::now() + budget;
+    let mut stream = connect_addresses(&upstream.host, upstream.port, deadline, policy)?;
+    stream
+        .set_write_timeout(Some(deadline.saturating_duration_since(Instant::now())))
+        .ok();
+    let greeting: &[u8] = if upstream.credentials.is_some() {
+        &[0x05, 0x02, 0x00, 0x02]
+    } else {
+        &[0x05, 0x01, 0x00]
+    };
+    stream
+        .write_all(greeting)
+        .map_err(|_| "Не отправить приветствие SOCKS5".to_string())?;
+
+    let mut method_reply = [0u8; 2];
+    read_exact_until(&mut stream, &mut method_reply, deadline)?;
+    if method_reply[0] != 0x05 {
+        return Err("Сервер не является SOCKS5-прокси".into());
+    }
+    match method_reply[1] {
+        0x00 => {}
+        0x02 => {
+            let creds = upstream
+                .credentials
+                .as_ref()
+                .ok_or("SOCKS5-прокси требует логин и пароль")?;
+            let ubytes = creds.username.as_bytes();
+            let pbytes = creds.password.as_bytes();
+            if ubytes.len() > 255 || pbytes.len() > 255 {
+                return Err("Логин или пароль длиннее 255 байт (ограничение SOCKS5)".into());
+            }
+            let mut auth = Vec::with_capacity(3 + ubytes.len() + pbytes.len());
+            auth.push(0x01);
+            auth.push(ubytes.len() as u8);
+            auth.extend_from_slice(ubytes);
+            auth.push(pbytes.len() as u8);
+            auth.extend_from_slice(pbytes);
+            stream
+                .write_all(&auth)
+                .map_err(|_| "Не отправить авторизацию SOCKS5".to_string())?;
+            let mut auth_reply = [0u8; 2];
+            read_exact_until(&mut stream, &mut auth_reply, deadline)?;
+            if auth_reply[1] != 0x00 {
+                return Err("SOCKS5-прокси отклонил логин или пароль".into());
+            }
+        }
+        0xFF => return Err("SOCKS5-прокси отклонил метод авторизации (проверьте логин/пароль)".into()),
+        other => return Err(format!("Неподдерживаемый метод авторизации SOCKS5 (0x{other:02x})")),
+    }
+
+    let clean_host = host.trim_start_matches('[').trim_end_matches(']');
+    let mut req = Vec::with_capacity(7 + clean_host.len());
+    req.extend_from_slice(&[0x05, 0x01, 0x00]);
+    if let Ok(v4) = clean_host.parse::<Ipv4Addr>() {
+        req.push(0x01);
+        req.extend_from_slice(&v4.octets());
+    } else if let Ok(v6) = clean_host.parse::<Ipv6Addr>() {
+        req.push(0x04);
+        req.extend_from_slice(&v6.octets());
+    } else {
+        let domain = clean_host.as_bytes();
+        if domain.is_empty() || domain.len() > 255 {
+            return Err("Некорректное доменное имя для SOCKS5".into());
+        }
+        req.push(0x03);
+        req.push(domain.len() as u8);
+        req.extend_from_slice(domain);
+    }
+    req.extend_from_slice(&port.to_be_bytes());
+    stream
+        .write_all(&req)
+        .map_err(|_| "Не отправить запрос подключения SOCKS5".to_string())?;
+
+    let mut head = [0u8; 4];
+    read_exact_until(&mut stream, &mut head, deadline)?;
+    if head[0] != 0x05 {
+        return Err("Некорректный ответ SOCKS5-прокси".into());
+    }
+    match head[1] {
+        0x00 => {}
+        0x02 => return Err("SOCKS5-прокси запретил подключение правилами (0x02)".into()),
+        0x03 | 0x04 => return Err("Целевой сервер недоступен с внешнего SOCKS5-прокси".into()),
+        0x05 => return Err("Целевой сервер отклонил соединение через SOCKS5 (0x05)".into()),
+        code => return Err(format!("SOCKS5-прокси вернул ошибку соединения (0x{code:02x})")),
+    }
+    match head[3] {
+        0x01 => {
+            let mut tail = [0u8; 6];
+            read_exact_until(&mut stream, &mut tail, deadline)?;
+        }
+        0x04 => {
+            let mut tail = [0u8; 18];
+            read_exact_until(&mut stream, &mut tail, deadline)?;
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            read_exact_until(&mut stream, &mut len, deadline)?;
+            let mut tail = vec![0u8; (len[0] as usize) + 2];
+            read_exact_until(&mut stream, &mut tail, deadline)?;
+        }
+        _ => return Err("Неизвестный тип адреса в ответе SOCKS5".into()),
+    }
+    stream.set_read_timeout(None).ok();
+    stream.set_write_timeout(None).ok();
+    Ok(stream)
+}
+
+fn open_http_connect(
     upstream: &Upstream,
     host: &str,
     port: u16,
@@ -438,22 +656,88 @@ fn open_upstream(
         .write_all(request.as_bytes())
         .map_err(|_| "Не отправить CONNECT внешнему прокси".to_string())?;
     let head = read_head(&mut stream, deadline)
-        .map_err(|_| "Внешний прокси не ответил на CONNECT вовремя".to_string())?;
+        .map_err(|_| "Внешний HTTP-прокси не ответил на CONNECT вовремя".to_string())?;
     match status_code(&head) {
         Some(200) => {
             stream.set_read_timeout(None).ok();
             stream.set_write_timeout(None).ok();
             Ok(stream)
         }
-        Some(407) => Err("Внешний прокси отклонил логин или пароль (407)".into()),
-        Some(403) => Err("Внешний прокси запретил CONNECT к этому хосту (403)".into()),
-        Some(code) => Err(format!("Внешний прокси ответил HTTP {code} на CONNECT")),
-        None => Err("Некорректный HTTP-ответ внешнего прокси".into()),
+        Some(407) => Err("HTTP-прокси отклонил логин или пароль (407)".into()),
+        Some(403) => Err("HTTP-прокси запретил CONNECT к этому хосту (403)".into()),
+        Some(code) => Err(format!("HTTP-прокси ответил HTTP {code} на CONNECT")),
+        None => Err("Сервер не является HTTP CONNECT-прокси".into()),
     }
 }
 
+pub fn open_upstream(
+    upstream: &Upstream,
+    host: &str,
+    port: u16,
+    policy: VpnPolicy,
+    budget: Duration,
+) -> Result<TcpStream, String> {
+    match upstream.protocol {
+        ProxyProtocol::Socks5 => open_socks5(upstream, host, port, policy, budget),
+        ProxyProtocol::Http => open_http_connect(upstream, host, port, policy, budget),
+    }
+}
+
+pub fn detect_protocol_against(
+    upstream: &mut Upstream,
+    protocol_explicit: bool,
+    policy: VpnPolicy,
+    probe_host: &str,
+    probe_port: u16,
+) -> Result<ProxyProtocol, String> {
+    let budget = Duration::from_secs(7);
+    if protocol_explicit {
+        open_upstream(upstream, probe_host, probe_port, policy, budget)?;
+        return Ok(upstream.protocol);
+    }
+    let order = if matches!(upstream.port, 80 | 3128 | 8000 | 8080 | 8888) {
+        [ProxyProtocol::Http, ProxyProtocol::Socks5]
+    } else {
+        [ProxyProtocol::Socks5, ProxyProtocol::Http]
+    };
+    let mut auth_error = None;
+    let mut last_error = String::new();
+    for candidate in order {
+        let mut trial = upstream.clone();
+        trial.protocol = candidate;
+        match open_upstream(&trial, probe_host, probe_port, policy, budget) {
+            Ok(_) => {
+                upstream.protocol = candidate;
+                return Ok(candidate);
+            }
+            Err(error) => {
+                if error.contains("логин") || error.contains("пароль") || error.contains("407") {
+                    auth_error = Some(error);
+                } else {
+                    last_error = error;
+                }
+            }
+        }
+    }
+    Err(auth_error.unwrap_or(last_error))
+}
+
+pub fn detect_protocol(
+    upstream: &mut Upstream,
+    protocol_explicit: bool,
+    policy: VpnPolicy,
+) -> Result<ProxyProtocol, String> {
+    detect_protocol_against(
+        upstream,
+        protocol_explicit,
+        policy,
+        "daily-cloudcode-pa.googleapis.com",
+        443,
+    )
+}
+
 fn open_route(host: &str, port: u16, config: &ProxyConfig) -> Result<TcpStream, String> {
-    if !is_gate_host(host) || matches!(config.mode, Mode::Vpn | Mode::SniDirect) {
+    if !is_gate_host(host) || config.mode == Mode::Vpn {
         return connect_addresses(
             host,
             port,
@@ -466,7 +750,7 @@ fn open_route(host: &str, port: u16, config: &ProxyConfig) -> Result<TcpStream, 
             open_upstream(upstream, host, port, config.vpn_policy, CONNECT_BUDGET)
         }
         (Mode::OwnProxy, None) => {
-            Err("Режим own-proxy включён, но внешний HTTP-прокси не настроен".into())
+            Err("Режим своего прокси включён, но прокси не указан".into())
         }
         (Mode::Auto, Some(upstream)) => {
             match open_upstream(upstream, host, port, config.vpn_policy, CONNECT_BUDGET) {
@@ -485,7 +769,7 @@ fn open_route(host: &str, port: u16, config: &ProxyConfig) -> Result<TcpStream, 
             Instant::now() + CONNECT_BUDGET,
             config.vpn_policy,
         ),
-        _ => Err("Недопустимая комбинация режима прокси".into()),
+        (Mode::Vpn, _) => unreachable!(),
     }
 }
 
@@ -495,6 +779,8 @@ fn pump(mut from: TcpStream, mut to: TcpStream) {
 }
 
 fn tunnel(client: TcpStream, upstream: TcpStream) {
+    let _ = super::socket::configure_tcp_stream(&client);
+    let _ = super::socket::configure_tcp_stream(&upstream);
     let _ = client.set_read_timeout(None);
     let _ = client.set_write_timeout(None);
     let _ = upstream.set_read_timeout(None);
@@ -531,7 +817,7 @@ fn handle_client(mut client: TcpStream, config: &ProxyConfig, local_port: u16) {
         }
     };
     if let Some(is_head) = parse_pac_request(&head) {
-        let body = pac_script(local_port, config.mode);
+        let body = pac_script_for_products(local_port, &config.products);
         let headers = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
@@ -585,6 +871,16 @@ pub fn saved_port() -> Option<u16> {
     (state.schema == 1 && state.port != 0).then_some(state.port)
 }
 
+pub fn listener_alive() -> bool {
+    saved_port().is_some_and(|port| {
+        TcpStream::connect_timeout(
+            &SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            Duration::from_millis(250),
+        )
+        .is_ok()
+    })
+}
+
 pub fn url_at(port: u16) -> String {
     format!("http://{}:{port}", Ipv4Addr::LOCALHOST)
 }
@@ -626,15 +922,19 @@ pub fn run() -> Result<(), String> {
                 .unwrap_or_else(|| "неизвестная ошибка".into())
         )
     })?;
+    let _ = super::socket::configure_tcp_listener(&listener);
     save_port(port)?;
     #[cfg(target_os = "macos")]
-    super::proxy_session::apply(&url_at(port))?;
-    eprintln!("Локальный Antigravity CONNECT-прокси: {}", url_at(port));
+    if super::proxy_config::load()
+        .map(|c| c.products.antigravity)
+        .unwrap_or(true)
+    {
+        super::proxy_session::apply(&url_at(port))?;
+    }
+    eprintln!("Локальный шлюз Antigravity / Gemini: {}", url_at(port));
     for connection in listener.incoming() {
         match connection {
             Ok(client) => {
-                // Re-read on each connection: proxy set/clear and VPN policy changes
-                // do not require interrupting established model streams.
                 let config = super::proxy_config::load().unwrap_or_else(|_| ProxyConfig {
                     mode: Mode::OwnProxy,
                     ..ProxyConfig::default()
@@ -647,48 +947,226 @@ pub fn run() -> Result<(), String> {
     Err("Цикл локального прокси завершился".into())
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct ProductCheck {
+    pub name: &'static str,
+    pub host: &'static str,
+    pub ok: bool,
+    pub geo_blocked: bool,
+    pub latency_ms: u128,
+    pub http_status: Option<u16>,
+    pub detail: String,
+}
+
+pub(crate) fn is_geo_blocked_response(raw_text: &str) -> bool {
+    let lower = raw_text.to_ascii_lowercase();
+    let header_end = lower.find("\r\n\r\n").unwrap_or(lower.len());
+    let headers = &lower[..header_end];
+    for line in headers.lines() {
+        if let Some(loc) = line.strip_prefix("location:") {
+            let loc = loc.trim();
+            if loc.contains("/faq")
+                || loc.contains("unsupported")
+                || loc.contains("available-regions")
+                || loc.contains("region_not_supported")
+                || loc.contains("unavailable")
+            {
+                return true;
+            }
+        }
+    }
+    raw_text.contains("не поддерживается в вашей стране")
+        || lower.contains("isn't currently supported in your country")
+        || lower.contains("gemini isn't currently supported")
+        || lower.contains("available regions for google ai studio")
+}
+
+fn probe_single_product(
+    name: &'static str,
+    host: &'static str,
+    path: &'static str,
+    check_geo: bool,
+    upstream: Option<&Upstream>,
+    policy: VpnPolicy,
+) -> ProductCheck {
+    let start = Instant::now();
+    let stream_res = match upstream {
+        Some(proxy) => open_upstream(proxy, host, 443, policy, TEST_BUDGET),
+        None => connect_addresses(host, 443, start + TEST_BUDGET, policy),
+    };
+    let stream = match stream_res {
+        Ok(stream) => stream,
+        Err(error) => {
+            return ProductCheck {
+                name,
+                host,
+                ok: false,
+                geo_blocked: false,
+                latency_ms: start.elapsed().as_millis(),
+                http_status: None,
+                detail: error,
+            };
+        }
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(8))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(8))).ok();
+    let mut tls = match native_tls::TlsConnector::new()
+        .map_err(|_| "Ошибка системного TLS".to_string())
+        .and_then(|c| {
+            c.connect(host, stream)
+                .map_err(|_| "Прокси открыл туннель, но TLS с Google не установлен".to_string())
+        }) {
+        Ok(tls) => tls,
+        Err(error) => {
+            return ProductCheck {
+                name,
+                host,
+                ok: false,
+                geo_blocked: false,
+                latency_ms: start.elapsed().as_millis(),
+                http_status: None,
+                detail: error,
+            };
+        }
+    };
+    let method = if check_geo { "GET" } else { "HEAD" };
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36\r\nAccept-Language: en-US,en;q=0.9\r\nConnection: close\r\n\r\n"
+    );
+    if tls.write_all(req.as_bytes()).is_err() {
+        return ProductCheck {
+            name,
+            host,
+            ok: false,
+            geo_blocked: false,
+            latency_ms: start.elapsed().as_millis(),
+            http_status: None,
+            detail: "TLS открыт, но HTTP-запрос не отправлен".into(),
+        };
+    }
+    let mut response = Vec::new();
+    let limit = if check_geo { 24 * 1024 } else { 8 * 1024 };
+    let _ = tls.take(limit).read_to_end(&mut response);
+    let latency_ms = start.elapsed().as_millis().max(1);
+    let Some(code) = status_code(&response) else {
+        return ProductCheck {
+            name,
+            host,
+            ok: false,
+            geo_blocked: false,
+            latency_ms,
+            http_status: None,
+            detail: "Google не вернул корректный HTTP-ответ".into(),
+        };
+    };
+    let text = String::from_utf8_lossy(&response);
+    if check_geo && is_geo_blocked_response(&text) {
+        return ProductCheck {
+            name,
+            host,
+            ok: false,
+            geo_blocked: true,
+            latency_ms,
+            http_status: Some(code),
+            detail: "Регион заблокирован Google (IP прокси определяется как РФ / неподдерживаемая страна)".into(),
+        };
+    }
+    let ok = code < 500;
+    let detail = if ok {
+        format!("Доступ открыт (HTTP {code}, {latency_ms} мс)")
+    } else {
+        format!("Сервер Google вернул ошибку HTTP {code}")
+    };
+    ProductCheck {
+        name,
+        host,
+        ok,
+        geo_blocked: false,
+        latency_ms,
+        http_status: Some(code),
+        detail,
+    }
+}
+
+pub fn check_all_products(upstream: Option<&Upstream>, policy: VpnPolicy) -> Vec<ProductCheck> {
+    const TARGETS: &[(&str, &str, &str, bool)] = &[
+        ("Antigravity IDE (основной)", "daily-cloudcode-pa.googleapis.com", "/", false),
+        ("Antigravity IDE (резервный)", "cloudcode-pa.googleapis.com", "/", false),
+        ("Gemini в браузере", "gemini.google.com", "/app", true),
+        ("Google AI Studio", "aistudio.google.com", "/", true),
+        ("Gemini Desktop", "robinfrontend-pa.googleapis.com", "/", false),
+        ("«Спросить Gemini» в Chrome", "geminiweb-pa.googleapis.com", "/", false),
+    ];
+    thread::scope(|scope| {
+        let handles: Vec<_> = TARGETS
+            .iter()
+            .map(|&(name, host, path, check_geo)| {
+                scope.spawn(move || probe_single_product(name, host, path, check_geo, upstream, policy))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join().unwrap_or(ProductCheck {
+                    name: "Проверка",
+                    host: "",
+                    ok: false,
+                    geo_blocked: false,
+                    latency_ms: 0,
+                    http_status: None,
+                    detail: "Поток проверки прерван".into(),
+                })
+            })
+            .collect()
+    })
+}
+
 pub fn test_upstream() -> Result<String, String> {
     let config = super::proxy_config::load()?;
     let upstream = config
         .upstream
         .as_ref()
-        .ok_or("Сначала выполните proxy set")?;
-    let host = "daily-cloudcode-pa.googleapis.com";
-    let stream = open_upstream(upstream, host, 443, config.vpn_policy, TEST_BUDGET)?;
-    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-    stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
-    let mut tls = native_tls::TlsConnector::new()
-        .map_err(|_| "Не удалось инициализировать системный TLS".to_string())?
-        .connect(host, stream)
-        .map_err(|_| "CONNECT принят, но TLS с Google не установлен".to_string())?;
-    tls.write_all(
-        b"HEAD / HTTP/1.1\r\nHost: daily-cloudcode-pa.googleapis.com\r\nConnection: close\r\n\r\n",
-    )
-    .map_err(|_| "TLS открыт, но HTTP-запрос не отправлен".to_string())?;
-    let mut response = Vec::new();
-    tls.take(16 * 1024)
-        .read_to_end(&mut response)
-        .map_err(|_| "TLS открыт, но HTTP-ответ не получен".to_string())?;
-    let code = status_code(&response).ok_or("Google вернул неизвестный HTTP-ответ")?;
+        .ok_or("Сначала укажите прокси (SOCKS5 или HTTP)")?;
+    let checks = check_all_products(Some(upstream), config.vpn_policy);
+    let ok_count = checks.iter().filter(|c| c.ok).count();
+    let geo_blocked = checks.iter().any(|c| c.geo_blocked);
+    if ok_count == 0 {
+        let first_err = checks
+            .first()
+            .map(|c| c.detail.clone())
+            .unwrap_or_else(|| "нет ответа".into());
+        return Err(format!("Прокси не прошёл проверку: {first_err}"));
+    }
+    if geo_blocked {
+        return Err(format!(
+            "{} работает ({ok_count}/{} сервисов), но Google отклоняет регион этого IP для Gemini / AI Studio — выберите зарубежный прокси (США / Европа)",
+            upstream.protocol.label(),
+            checks.len()
+        ));
+    }
+    let avg_ms = checks.iter().filter(|c| c.ok).map(|c| c.latency_ms).sum::<u128>()
+        / (ok_count as u128);
     Ok(format!(
-        "HTTP CONNECT + TLS + HTTP работают; Google ответил HTTP {code}. Доступ модели и регион аккаунта этим не проверяются"
+        "{} проверен: доступ открыт ко всем сервисам ({ok_count}/{}), средний отклик ~{avg_ms} мс",
+        upstream.protocol.label(),
+        checks.len()
     ))
 }
 
 #[cfg(target_os = "macos")]
-fn user_id() -> Result<String, String> {
+pub(crate) fn user_id() -> Result<String, String> {
     use std::os::unix::fs::MetadataExt;
     let uid = fs::metadata(crate::system::env::expand_env_vars("~"))
         .map_err(|e| e.to_string())?
         .uid();
     if uid == 0 {
-        return Err("Не найден пользователь GUI для локального прокси".into());
+        return Err("Не найден пользователь GUI для фонового агента".into());
     }
     Ok(uid.to_string())
 }
 
 #[cfg(target_os = "macos")]
-fn launchctl<I, S>(args: I) -> Result<std::process::Output, String>
+pub(crate) fn launchctl<I, S>(args: I) -> Result<std::process::Output, String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
@@ -716,9 +1194,37 @@ fn agent_path() -> PathBuf {
         .join(format!("{AGENT_LABEL}.plist"))
 }
 
-#[cfg(target_os = "macos")]
-fn installed_exe() -> PathBuf {
-    super::config::directory().join("ag_proxy")
+pub(crate) fn installed_exe() -> PathBuf {
+    #[cfg(windows)]
+    {
+        super::config::directory().join("ag_proxy.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        super::config::directory().join("ag_proxy")
+    }
+}
+
+pub(crate) fn ensure_installed_exe() -> Result<PathBuf, String> {
+    super::config::ensure_directory()?;
+    let source = std::env::current_exe().map_err(|e| e.to_string())?;
+    let destination = installed_exe();
+    if source != destination {
+        let bytes = fs::read(&source).map_err(|e| format!("Чтение исполняемого файла: {e}"))?;
+        let _ = fs::remove_file(&destination);
+        crate::system::fs_utils::robust_write_file(&destination, &bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))
+                .map_err(|e| e.to_string())?;
+        }
+        crate::system::fs_utils::post_write_hook(&destination)?;
+        super::config::inherit_directory_owner(&destination)?;
+    }
+    #[cfg(target_os = "macos")]
+    install_cli_shortcut(&destination);
+    Ok(destination)
 }
 
 #[cfg(target_os = "macos")]
@@ -738,7 +1244,6 @@ fn install_cli_shortcut(executable: &Path) {
             if fs::read_link(shortcut).ok().as_deref() == Some(executable) {
                 return;
             }
-            // Do not overwrite a symlink pointing elsewhere.
         }
         Ok(_) => return,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -768,7 +1273,7 @@ pub fn cli_shortcut_ready() -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn xml(value: &str) -> String {
+pub(crate) fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -782,9 +1287,9 @@ fn agent_plist(executable: &Path) -> String {
     let log = super::config::directory().join("local-proxy.log");
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{AGENT_LABEL}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>{LOCAL_PROXY_FLAG}</string></array>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>5</integer>\n<key>StandardOutPath</key><string>{}</string><key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",
-        xml(&executable.to_string_lossy()),
-        xml(&log.to_string_lossy()),
-        xml(&log.to_string_lossy())
+        xml_escape(&executable.to_string_lossy()),
+        xml_escape(&log.to_string_lossy()),
+        xml_escape(&log.to_string_lossy())
     )
 }
 
@@ -803,30 +1308,13 @@ fn bootout() {
     }
 }
 
-/// Install only a per-user LaunchAgent. The root DNS daemon is a separate legacy mode.
-/// Upstream proxy credentials may be added or rotated later without restarting this agent.
 pub fn enable() -> Result<u16, String> {
     #[cfg(not(target_os = "macos"))]
-    return Err("Автозапуск локального прокси пока реализован только для macOS".into());
+    return Err("Автозапуск локального шлюза сейчас поддерживается на macOS".into());
     #[cfg(target_os = "macos")]
     {
         let config = super::proxy_config::load()?;
-        if config.mode == Mode::SniDirect {
-            return Err("Для sni-direct локальный прокси не нужен; используйте unlock".into());
-        }
-        super::config::ensure_directory()?;
-        let source = std::env::current_exe().map_err(|e| e.to_string())?;
-        let destination = installed_exe();
-        if source != destination {
-            let bytes = fs::read(&source).map_err(|e| format!("Чтение исполняемого файла: {e}"))?;
-            crate::system::fs_utils::robust_write_file(&destination, &bytes)?;
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))
-                .map_err(|e| e.to_string())?;
-            crate::system::fs_utils::post_write_hook(&destination)?;
-            super::config::inherit_directory_owner(&destination)?;
-        }
-        install_cli_shortcut(&destination);
+        let destination = ensure_installed_exe()?;
         let plist = agent_path();
         if let Some(parent) = plist.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -850,7 +1338,7 @@ pub fn enable() -> Result<u16, String> {
         .map_err(|e| e.to_string())?;
         if !output.status.success() && !loaded() {
             return Err(format!(
-                "LaunchAgent не загружен: {}",
+                "LaunchAgent локального прокси не загружен: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
@@ -863,17 +1351,22 @@ pub fn enable() -> Result<u16, String> {
                 )
                 .is_ok()
                 {
-                    super::proxy_session::apply(&url_at(port))?;
-                    super::gemini_apps::enable_system_pac(&pac_url_at(port))?;
+                    if config.products.antigravity {
+                        super::proxy_session::apply(&url_at(port))?;
+                    } else {
+                        let _ = super::proxy_session::restore();
+                    }
+                    if config.products.needs_system_pac() {
+                        super::gemini_apps::enable_system_pac(&pac_url_at(port))?;
+                    } else {
+                        let _ = super::gemini_apps::disable_system_pac();
+                    }
                     return Ok(port);
                 }
             }
             thread::sleep(Duration::from_millis(100));
         }
-        Err(
-            "Локальный прокси не подтвердил готовность; AG_LS_PROXY не оставлен на мёртвом порту"
-                .into(),
-        )
+        Err("Локальный прокси не подтвердил готовность за 8 секунд".into())
     }
 }
 
@@ -889,15 +1382,14 @@ pub fn disable() -> Result<(), String> {
         let plist = agent_path();
         if plist.exists() && !crate::system::journal::has_record(&plist) {
             errors.push(format!(
-                "{} не имеет журнала этой установки; чужой LaunchAgent не остановлен и не удалён",
+                "{} не имеет журнала этой установки; чужой LaunchAgent сохранён",
                 plist.display()
             ));
         } else {
             bootout();
             if plist.exists() {
-                match crate::system::journal::restore(&plist) {
-                    Ok(_) => {}
-                    Err(error) => errors.push(error),
+                if let Err(error) = crate::system::journal::restore(&plist) {
+                    errors.push(error);
                 }
             }
         }
@@ -917,7 +1409,10 @@ pub fn disable() -> Result<(), String> {
         }
         let executable = installed_exe();
         remove_cli_shortcut(&executable);
-        if std::env::current_exe().ok().as_ref() != Some(&executable) && executable.exists() {
+        if !crate::core::autopatch::is_enabled()
+            && std::env::current_exe().ok().as_ref() != Some(&executable)
+            && executable.exists()
+        {
             if let Err(error) = fs::remove_file(executable) {
                 errors.push(error.to_string());
             }
@@ -934,13 +1429,14 @@ pub fn summary() -> serde_json::Value {
     let config = super::proxy_config::load();
     serde_json::json!({
         "configured": config.as_ref().ok().and_then(|c| c.upstream.as_ref()).is_some(),
+        "protocol": config.as_ref().ok().and_then(|c| c.upstream.as_ref()).map(|u| u.protocol.to_string()),
         "mode": config.as_ref().ok().map(|c| c.mode.to_string()),
         "vpn_policy": config.as_ref().ok().map(|c| c.vpn_policy.to_string()),
+        "products": config.as_ref().ok().map(|c| c.products),
         "local_port": saved_port(),
-        "listener": saved_port().is_some_and(|port| TcpStream::connect_timeout(&SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port), Duration::from_millis(300)).is_ok()),
+        "listener": listener_alive(),
         "pac_enabled": super::gemini_apps::pac_active(),
         "credentials": "omitted",
-        "model_access": "not_tested"
     })
 }
 
@@ -1000,7 +1496,7 @@ mod tests {
     }
 
     #[test]
-    fn local_connect_uses_mock_upstream_and_tunnels_bytes_without_tls_termination() {
+    fn local_connect_uses_mock_http_upstream_and_tunnels_bytes() {
         let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let upstream_port = upstream_listener.local_addr().unwrap().port();
         let server = thread::spawn(move || {
@@ -1029,6 +1525,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            products: Products::default(),
         };
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = listener.local_addr().unwrap();
@@ -1052,8 +1549,100 @@ mod tests {
     }
 
     #[test]
-    fn local_listener_serves_pac_file_with_ai_domains_and_bound_port() {
-        let config = ProxyConfig::default();
+    fn local_connect_uses_mock_socks5_upstream_with_rfc1929_auth_and_domain_atyp() {
+        let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            for round in 0..2 {
+                let (mut stream, _) = upstream_listener.accept().unwrap();
+                let mut greet = [0u8; 4];
+                stream.read_exact(&mut greet).unwrap();
+                assert_eq!(&greet, &[0x05, 0x02, 0x00, 0x02]);
+                stream.write_all(&[0x05, 0x02]).unwrap();
+
+                let mut auth_head = [0u8; 2];
+                stream.read_exact(&mut auth_head).unwrap();
+                assert_eq!(auth_head[0], 0x01);
+                let mut u = vec![0u8; auth_head[1] as usize];
+                stream.read_exact(&mut u).unwrap();
+                let mut plen = [0u8; 1];
+                stream.read_exact(&mut plen).unwrap();
+                let mut p = vec![0u8; plen[0] as usize];
+                stream.read_exact(&mut p).unwrap();
+                assert_eq!(u, b"user");
+                assert_eq!(p, b"secret");
+                stream.write_all(&[0x01, 0x00]).unwrap();
+
+                let mut req_head = [0u8; 5];
+                stream.read_exact(&mut req_head).unwrap();
+                assert_eq!(&req_head[..4], &[0x05, 0x01, 0x00, 0x03]); // ATYP=0x03 remote DNS!
+                let dlen = req_head[4] as usize;
+                let mut domain = vec![0u8; dlen];
+                stream.read_exact(&mut domain).unwrap();
+                assert_eq!(domain, b"gemini.google.com");
+                let mut port_bytes = [0u8; 2];
+                stream.read_exact(&mut port_bytes).unwrap();
+                assert_eq!(u16::from_be_bytes(port_bytes), 443);
+
+                stream
+                    .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x01, 0xBB])
+                    .unwrap();
+                if round == 1 {
+                    let mut byte = [0u8; 1];
+                    stream.read_exact(&mut byte).unwrap();
+                    stream.write_all(&byte).unwrap();
+                }
+            }
+        });
+
+        let mut upstream = Upstream::with_protocol(
+            ProxyProtocol::Http,
+            "127.0.0.1".into(),
+            upstream_port,
+            Some(Credentials {
+                username: "user".into(),
+                password: "secret".into(),
+            }),
+        )
+        .unwrap();
+        let detected =
+            detect_protocol_against(&mut upstream, false, VpnPolicy::Use, "gemini.google.com", 443)
+                .unwrap();
+        assert_eq!(detected, ProxyProtocol::Socks5);
+        assert_eq!(upstream.protocol, ProxyProtocol::Socks5);
+
+        let config = ProxyConfig {
+            schema: 1,
+            mode: Mode::OwnProxy,
+            vpn_policy: VpnPolicy::Use,
+            upstream: Some(upstream),
+            products: Products::default(),
+        };
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (client, _) = listener.accept().unwrap();
+            handle_client(client, &config, address.port());
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .write_all(b"CONNECT gemini.google.com:443 HTTP/1.1\r\nHost: gemini.google.com\r\n\r\n")
+            .unwrap();
+        let response = read_head(&mut client, Instant::now() + Duration::from_secs(2)).unwrap();
+        assert_eq!(status_code(&response), Some(200));
+        client.write_all(b"Z").unwrap();
+        let mut echoed = [0u8; 1];
+        client.read_exact(&mut echoed).unwrap();
+        assert_eq!(&echoed, b"Z");
+        drop(client);
+        server.join().unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn local_listener_serves_pac_file_with_selected_product_domains() {
+        let mut config = ProxyConfig::default();
+        config.products.chrome_gemini = false;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let port = address.port();
@@ -1069,12 +1658,26 @@ mod tests {
         client.read_to_end(&mut full).unwrap();
         let text = String::from_utf8(full).unwrap();
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(text.contains("application/x-ns-proxy-autoconfig"));
-        assert!(text.contains(&format!("PROXY 127.0.0.1:{port}")));
         assert!(text.contains("\"gemini.google.com\""));
-        assert!(text.contains("\"aistudio.google.com\""));
-        assert!(text.contains("\"generativelanguage.googleapis.com\""));
+        assert!(text.contains("\"robinfrontend-pa.googleapis.com\""));
+        assert!(!text.contains("\"geminiweb-pa.googleapis.com\""));
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn geo_blocked_redirect_and_body_markers_are_detected() {
+        assert!(is_geo_blocked_response(
+            "HTTP/1.1 302 Found\r\nLocation: https://gemini.google.com/faq\r\n\r\n"
+        ));
+        assert!(is_geo_blocked_response(
+            "HTTP/1.1 302 Found\r\nLocation: https://ai.google.dev/gemini-api/docs/available-regions\r\n\r\n"
+        ));
+        assert!(is_geo_blocked_response(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\nGemini пока не поддерживается в вашей стране"
+        ));
+        assert!(!is_geo_blocked_response(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html>Gemini Chat</html>"
+        ));
     }
 
     #[test]
@@ -1084,6 +1687,7 @@ mod tests {
             mode: Mode::OwnProxy,
             vpn_policy: VpnPolicy::Use,
             upstream: None,
+            products: Products::default(),
         };
         assert!(open_route("daily-cloudcode-pa.googleapis.com", 443, &config).is_err());
     }

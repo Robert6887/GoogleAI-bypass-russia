@@ -7,24 +7,23 @@
 
 ---
 
-## [2.7.0] - 2026-11-12
+## [2.7.0] - 2026-11-13
 
 ### Добавлено и улучшено
-- **Единое интерактивное меню `[0-7]` и запуск одной командой с GitHub**:
-  - Поддержка прямого интерактивного запуска `curl -fsSL .../unlock_and_restore.sh | bash` через `/dev/tty`.
-  - Разделение этапов: пункт `[1]` накатывает бинарный патч и запускает локальный шлюз даже до настройки прокси, пункт `[2]` позволяет в любой момент вставить или заменить HTTP-прокси на лету с автопроверкой `CONNECT + TLS + HTTP`, пункт `[6]` выполняет полный чистый откат.
-  - Автоматическая установка короткого ярлыка `/usr/local/bin/ag-bypass` на macOS (с чистым удалением при откате).
-- **Универсальный парсер форматов прокси**:
-  - При вставке принимаются `login:password@ip:port`, `ip:port:login:password`, `ip:port@login:password`, `http://...` и `ip:port`.
-- **Локальный HTTP CONNECT-шлюз, точечный PAC и поддержка всей экосистемы Gemini**:
-  - Переименование `https_proxy` → `AG_LS_PROXY` без изменения длины бинарников и запуск пользовательского LaunchAgent `com.antigravity.bypass.local-proxy`.
-  - Раздача локального `/proxy.pac` и автонастройка PAC на физических интерфейсах macOS (`en*`) исключительно для доменов Google AI (`gemini.google.com`, `aistudio.google.com`, `generativelanguage.googleapis.com`, `notebooklm.google.com` и др.), оставляя весь остальной трафик `DIRECT`.
-  - Поддержка нативного **Gemini Desktop** (`/Applications/Gemini.app`) через системный PAC (`NWConnection`) и изолированную переменную GUI-сессии `grpc_proxy` + домены `robinfrontend-pa.googleapis.com` / `proactivebackend-pa.googleapis.com` / `directpath-pa.googleapis.com`.
-  - Разблокировка встроенной панели **«Спросить Gemini» в Google Chrome (GLIC)** (`geminiweb-pa.googleapis.com`, `aratea-pa.googleapis.com` + `Local State`: `variations_country = "us"`, `is_glic_eligible = true` с хирургическим бэкапом и откатом в `[6]`).
-  - Политика `bypass-vpn` (`IP_BOUND_IF` / `IPV6_BOUND_IF`) по умолчанию для работы параллельно с `FortiVPN`, `NetBird` и `Happ`.
-- **Безопасное авто-закрытие Antigravity на macOS и удаление legacy**:
-  - Проверка цепочки родительских PID перед мягким завершением процессов Antigravity.
-  - Удалены устаревшие файлы `macos-instant-fix.py`, `.command`-скрипты и старые бинарные артефакты.
+- **Нативная поддержка `SOCKS5` и `HTTP` прокси с автоопределением и удалением в 1 клик**:
+  - Локальный шлюз (`127.0.0.1:53129`) теперь поддерживает как **SOCKS5** (RFC 1928 / RFC 1929 с удалённым разрешением доменов `ATYP=0x03` / `socks5h` без локальных DNS-утечек), так и **HTTP CONNECT** (включая локальные SOCKS5/HTTP порты `127.0.0.1`), без необходимости докупать отдельный HTTP-прокси при наличии SOCKS5.
+  - Если вставить `login:pass@ip:port` или `ip:port:login:pass` без префикса схемы, утилита сама определяет рабочий протокол (`SOCKS5` или `HTTP`).
+  - В меню `[2]` добавлено явное удаление сохранённого прокси одной кнопкой (`ag-bypass proxy clear`).
+- **Единый мастер настройки продуктов `[1–5]` и выбор отдельных компонентов**:
+  - Упрощено главное меню `[1–5]`: в пункте `[1]` пользователь в одном потоке отмечает нужные продукты (`Antigravity IDE и CLI`, `Автопатч Antigravity`, `Gemini Desktop`, `Gemini в браузере и AI Studio`, `Кнопка «Спросить Gemini» в Chrome` — или `Enter` для всех сразу) и тут же указывает прокси.
+  - Локальный `/proxy.pac` формирует список доменов строго под выбранные пользователем продукты.
+- **Автопатч Antigravity после обновлений (`autopatch`)**:
+  - Добавлен фоновый сторож обновлений (`com.antigravity.bypass.autopatch` с `WatchPaths` на macOS и задача планировщика на Windows), который после автообновления Antigravity архивирует чистый бинарник новой версии в `.ag-backups` и автоматически возвращает патч.
+- **Живой чекер прокси и гео-блокировки по всем 6 сервисам Google (`[3]`)**:
+  - Параллельная проверка `Antigravity Daily`, `Antigravity Prod`, `Gemini Web (/app)`, `Google AI Studio`, `Gemini Desktop` и `Gemini в Chrome` с замером пинга (мс) и распознаванием региональных редиректов Google (`unsupported` / `/faq`). Позволяет проверить любой новый прокси сразу после покупки без перезаписи текущих настроек.
+- **Глубокий чистый откат до заводского состояния (`[4]`) и удаление SmartDNS / бесплатных прокси**:
+  - Полностью вырезаны все публичные DNS-обходы (`DNS-AI.RU`, `Comss.one`, `Geohide.ru`, `Xbox-DNS`, `sni-direct`), порт-53 релей и встроенные бесплатные выходы.
+  - Полный откат (`[4]` / `sudo ag-bypass rollback`) восстанавливает эталонные файлы из `.ag-backups/<sha256>.bin`, откатывает системный PAC и `Local State` в Chrome, а также вычищает системные хвосты прошлых/сторонних кряков (`/etc/hosts`, `/etc/resolver/*.ag-backups`, старые демоны `watchdog` / `ag_dns`, `/Library/Application Support/AntigravityBypass`), не затрагивая чаты, воркспейсы и пользовательские данные.
 
 ---
 

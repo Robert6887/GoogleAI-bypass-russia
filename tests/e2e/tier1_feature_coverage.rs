@@ -132,7 +132,7 @@ fn test_f2_05_os_tuning_idempotency() {
 }
 
 // =========================================================================
-// FEATURE 3: Multi-Provider SNI Relay Pool (Comss, Xbox-DNS)
+// FEATURE 3: Upstream Proxy Endpoint Pool (SOCKS5 / HTTP)
 // =========================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,15 +157,15 @@ pub struct RelayNode {
 pub const TEST_MULTI_PROVIDER_RELAYS: &[RelayNode] = &[
     RelayNode {
         ip: "83.220.169.155",
-        provider: "Comss.one",
-        location: "Frankfurt (DE) 10G Anycast",
+        provider: "SOCKS5-EU",
+        location: "Frankfurt (DE) 10G",
         region: RelayRegion::EuropeCentral,
         bandwidth_mbps: 10000,
         priority_weight: 50,
     },
     RelayNode {
         ip: "111.88.96.50",
-        provider: "Xbox-DNS",
+        provider: "SOCKS5-Global",
         location: "Primary Anycast",
         region: RelayRegion::AnycastGlobal,
         bandwidth_mbps: 1000,
@@ -173,7 +173,7 @@ pub const TEST_MULTI_PROVIDER_RELAYS: &[RelayNode] = &[
     },
     RelayNode {
         ip: "212.109.195.93",
-        provider: "Comss.one",
+        provider: "HTTP-EU",
         location: "Amsterdam (NL) 10G High-Speed",
         region: RelayRegion::EuropeCentral,
         bandwidth_mbps: 10000,
@@ -181,7 +181,7 @@ pub const TEST_MULTI_PROVIDER_RELAYS: &[RelayNode] = &[
     },
     RelayNode {
         ip: "111.88.96.51",
-        provider: "Xbox-DNS",
+        provider: "SOCKS5-Global",
         location: "Secondary Anycast",
         region: RelayRegion::AnycastGlobal,
         bandwidth_mbps: 1000,
@@ -189,7 +189,7 @@ pub const TEST_MULTI_PROVIDER_RELAYS: &[RelayNode] = &[
     },
     RelayNode {
         ip: "195.133.25.16",
-        provider: "Comss.one",
+        provider: "SOCKS5-Nordic",
         location: "Helsinki (FI) Low-Latency",
         region: RelayRegion::EuropeNorth,
         bandwidth_mbps: 1000,
@@ -197,16 +197,16 @@ pub const TEST_MULTI_PROVIDER_RELAYS: &[RelayNode] = &[
     },
     RelayNode {
         ip: "45.155.204.190",
-        provider: "Geohide",
-        location: "Cloud Edge (RU)",
+        provider: "HTTP-Fallback",
+        location: "Cloud Edge (Domestic)",
         region: RelayRegion::DomesticRu,
         bandwidth_mbps: 100,
         priority_weight: 0,
     },
     RelayNode {
         ip: "37.230.192.51",
-        provider: "Geohide",
-        location: "Secondary (RU)",
+        provider: "HTTP-Fallback",
+        location: "Secondary (Domestic)",
         region: RelayRegion::DomesticRu,
         bandwidth_mbps: 100,
         priority_weight: 0,
@@ -214,26 +214,26 @@ pub const TEST_MULTI_PROVIDER_RELAYS: &[RelayNode] = &[
 ];
 
 #[test]
-fn test_f3_01_multi_provider_pool_contains_comss_10g() {
-    let comss_frankfurt = TEST_MULTI_PROVIDER_RELAYS.iter().find(|r| r.ip == "83.220.169.155");
-    assert!(comss_frankfurt.is_some());
-    let node = comss_frankfurt.unwrap();
+fn test_f3_01_multi_provider_pool_contains_eu_10g() {
+    let eu_frankfurt = TEST_MULTI_PROVIDER_RELAYS.iter().find(|r| r.ip == "83.220.169.155");
+    assert!(eu_frankfurt.is_some());
+    let node = eu_frankfurt.unwrap();
     assert_eq!(node.bandwidth_mbps, 10000);
     assert_eq!(node.region, RelayRegion::EuropeCentral);
 
-    let comss_amsterdam = TEST_MULTI_PROVIDER_RELAYS.iter().find(|r| r.ip == "212.109.195.93");
-    assert!(comss_amsterdam.is_some());
-    assert_eq!(comss_amsterdam.unwrap().bandwidth_mbps, 10000);
+    let eu_amsterdam = TEST_MULTI_PROVIDER_RELAYS.iter().find(|r| r.ip == "212.109.195.93");
+    assert!(eu_amsterdam.is_some());
+    assert_eq!(eu_amsterdam.unwrap().bandwidth_mbps, 10000);
 }
 
 #[test]
-fn test_f3_02_multi_provider_pool_contains_xbox_anycast() {
-    let xbox_primary = TEST_MULTI_PROVIDER_RELAYS.iter().find(|r| r.ip == "111.88.96.50");
-    assert!(xbox_primary.is_some());
-    assert_eq!(xbox_primary.unwrap().region, RelayRegion::AnycastGlobal);
+fn test_f3_02_multi_provider_pool_contains_global_anycast() {
+    let global_primary = TEST_MULTI_PROVIDER_RELAYS.iter().find(|r| r.ip == "111.88.96.50");
+    assert!(global_primary.is_some());
+    assert_eq!(global_primary.unwrap().region, RelayRegion::AnycastGlobal);
 
-    let xbox_secondary = TEST_MULTI_PROVIDER_RELAYS.iter().find(|r| r.ip == "111.88.96.51");
-    assert!(xbox_secondary.is_some());
+    let global_secondary = TEST_MULTI_PROVIDER_RELAYS.iter().find(|r| r.ip == "111.88.96.51");
+    assert!(global_secondary.is_some());
 }
 
 #[test]
@@ -401,7 +401,7 @@ fn test_f5_05_composite_ranking_sorting_order() {
         ("212.109.195.93", compute_composite_score(RoutingPreference::PreferEurope10G, 55, 120, 45, 10000)),
     ];
     nodes.sort_by_key(|(_, score)| *score);
-    assert_eq!(nodes[0].0, "83.220.169.155", "Comss Frankfurt 10G must be sorted first");
+    assert_eq!(nodes[0].0, "83.220.169.155", "Frankfurt 10G SOCKS5 proxy must be sorted first");
 }
 
 // =========================================================================
@@ -667,7 +667,7 @@ fn test_f9_01_benchmark_table_headers() {
 fn test_f9_02_benchmark_leader_identification() {
     let results = vec![
         BenchmarkResult {
-            name: "Comss.one (Frankfurt Anycast 10G)".into(),
+            name: "SOCKS5-EU (Frankfurt 10G)".into(),
             ip: "83.220.169.155".into(),
             tcp_rtt_ms: 28,
             tls_rtt_ms: 34,
@@ -678,7 +678,7 @@ fn test_f9_02_benchmark_leader_identification() {
             is_leader: true,
         },
         BenchmarkResult {
-            name: "Geohide (Secondary)".into(),
+            name: "HTTP-Fallback (Secondary)".into(),
             ip: "37.230.192.51".into(),
             tcp_rtt_ms: 16,
             tls_rtt_ms: 110,
@@ -749,9 +749,10 @@ fn test_f10_01_cli_help_flag() {
     let output = run_cli_command(&["--help"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "--help must exit with 0");
-    assert!(stdout.contains("ANTIGRAVITY-BYPASS-RUSSIA"));
-    assert!(stdout.contains("unlock"));
-    assert!(stdout.contains("dns"));
+    assert!(stdout.contains("ANTIGRAVITY & GEMINI BYPASS"));
+    assert!(stdout.contains("install"));
+    assert!(stdout.contains("proxy"));
+    assert!(stdout.contains("autopatch"));
     assert!(stdout.contains("rollback"));
 }
 

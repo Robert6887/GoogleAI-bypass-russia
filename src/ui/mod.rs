@@ -1,6 +1,5 @@
 pub mod dashboard;
 pub mod menu;
-pub mod speed;
 pub mod terminal;
 
 pub use menu::run_app;

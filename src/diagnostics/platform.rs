@@ -55,10 +55,8 @@ fn powershell(script: &str) -> Result<Value, &'static str> {
 fn namespace(value: &str) -> Option<String> {
     let name = value.trim_start_matches('.').to_ascii_lowercase();
     if value == "."
-        || net::provider::nrpt_domains().iter().any(|h| {
-            let host = h.trim_start_matches('.');
-            host == name || host.ends_with(&format!(".{name}"))
-        })
+        || name == "googleapis.com"
+        || net::local_proxy::is_gate_host(&name)
     {
         Some(value.to_ascii_lowercase())
     } else {
@@ -238,10 +236,14 @@ pub(super) fn network(ips: &[Ipv4Addr]) -> Value {
         };
         routes.push(json!({"destination": address, "route": route}));
     }
-    let files: Vec<_> = net::provider::nrpt_domains()
-        .iter()
-        .map(|h| h.trim_start_matches('.'))
-        .collect::<BTreeSet<_>>()
+    let resolver_hosts = [
+        "daily-cloudcode-pa.googleapis.com",
+        "cloudcode-pa.googleapis.com",
+        "aicode.googleapis.com",
+        "gemini.google.com",
+        "aistudio.google.com",
+    ];
+    let files: Vec<_> = resolver_hosts
         .into_iter()
         .map(|host| {
             let value = match read_limited(&Path::new("/etc/resolver").join(host), 16 * 1024) {

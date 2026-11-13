@@ -1,4 +1,5 @@
 pub mod asar;
+pub mod autopatch;
 pub mod detector;
 pub mod endpoint;
 mod endpoint_env;

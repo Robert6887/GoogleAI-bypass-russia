@@ -5,15 +5,14 @@ edition = "2021"
 rust-version = "1.89"
 authors = ["Antigravity Contributors"]
 license = "MIT"
-description = "Antigravity & Gemini Bypass and Clean Rollback Tool for macOS & Windows (Interactive Menu, Own HTTP CONNECT Proxy & Binary Patcher)"
+description = "Google AI & Antigravity Unlocker and Clean Rollback Tool for macOS & Windows (SOCKS5/HTTP Proxy, Auto-Patch, Gemini Desktop/Web/Chrome)"
 readme = "README.md"
-keywords = ["antigravity", "antigravity-russia", "gemini", "dns-forwarder", "cross-platform"]
+keywords = ["antigravity", "gemini", "socks5", "http-proxy", "cross-platform"]
 
 [dependencies]
 regex = { version = "1.10", default-features = false, features = ["std", "perf"] }
 memchr = "2.7"
 native-tls = "0.2"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls-alpn", "http2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

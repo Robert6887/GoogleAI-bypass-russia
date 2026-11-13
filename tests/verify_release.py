@@ -22,7 +22,7 @@ def run(*args):
 result = run("--version")
 assert result.returncode == 0 and result.stdout.strip() == f"antigravity-bypass-russia v{version}", result
 result = run("--help")
-assert result.returncode == 0 and all(word in result.stdout for word in ["unlock", "rollback", "diagnostics", "report"]), result
+assert result.returncode == 0 and all(word in result.stdout for word in ["install", "proxy", "autopatch", "rollback", "diagnostics", "report"]), result
 for args in [("invalid-command",), ("status", "extra"), ("report", ".", "extra")]:
     result = run(*args)
     assert result.returncode == 2, result
@@ -31,7 +31,7 @@ assert result.returncode == 0, result
 plain = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
 rows = [line for line in plain.splitlines() if line]
 assert len(rows) == 10 and all(len(line) == 69 for line in rows), plain
-assert all(label in plain for label in ["Обход:", "Свой прокси:", "Antigravity:", "Antigravity IDE:", "Antigravity CLI:", "Модель (журнал):"]), plain
+assert all(label in plain for label in ["Свой прокси:", "Antigravity IDE:", "Автопатч IDE:", "Gemini Desktop:", "Gemini Браузер:", "Gemini в Chrome:"]), plain
 print(f"PASS: release {version}, help, argument errors, status and frame alignment")
 
 # Saving evidence must work even on a runner with no installation, service or working Internet.
@@ -51,7 +51,7 @@ with tempfile.TemporaryDirectory(prefix="ag diagnostics ") as temporary:
     report = json.loads(reports[0].read_text(encoding="utf-8"))
     assert report["schema_version"] == 1 and report["bypass_version"] == version, report
     assert report["model_access"].startswith("not_tested"), report
-    assert all(section in report["checks"] for section in ["installations", "service", "configuration", "system_network", "model_observation", "dns_capabilities"]), report
+    assert all(section in report["checks"] for section in ["installations", "gateway", "autopatch", "configuration", "system_network", "model_observation"]), report
     assert report["checks"]["model_observation"]["completion_confirmed"] is False, report
     assert str(destination) not in reports[0].read_text(encoding="utf-8")
     result = run("report", str(destination / "missing"))

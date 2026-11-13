@@ -112,6 +112,8 @@ fn stop_owned_processes(paths: &[PathBuf]) -> Result<(), String> {
     }
 }
 
+#[cfg(any(windows, test))]
+#[allow(dead_code)]
 fn owned_application(executable: &std::path::Path, paths: &[PathBuf]) -> bool {
     let name = executable
         .file_name()

@@ -49,9 +49,9 @@ fn test_t3_02_direct_nrpt_with_bandwidth_gated_hosts() {
 #[test]
 fn test_t3_03_benchmark_leader_selection_with_route_preference() {
     let candidates = vec![
-        ("83.220.169.155", "Comss Frankfurt 10G", 50u64, 110u64, 50i32, 10000u64),
-        ("37.230.192.51", "Geohide Moscow", 15u64, 800u64, 0i32, 500u64),
-        ("111.88.96.50", "Xbox-DNS Anycast", 35u64, 130u64, 40i32, 8000u64),
+        ("83.220.169.155", "SOCKS5 Frankfurt 10G", 50u64, 110u64, 50i32, 10000u64),
+        ("37.230.192.51", "HTTP Fallback Domestic", 15u64, 800u64, 0i32, 500u64),
+        ("111.88.96.50", "SOCKS5 Global Anycast", 35u64, 130u64, 40i32, 8000u64),
     ];
 
     let mut scored: Vec<(&str, &str, u64)> = candidates
@@ -66,7 +66,7 @@ fn test_t3_03_benchmark_leader_selection_with_route_preference() {
         .collect();
 
     scored.sort_by_key(|(_, _, score)| *score);
-    assert_eq!(scored[0].0, "83.220.169.155", "Leader must be Comss Frankfurt 10G under PreferEurope10G");
+    assert_eq!(scored[0].0, "83.220.169.155", "Leader must be SOCKS5 Frankfurt 10G under PreferEurope10G");
 }
 
 #[test]
@@ -141,7 +141,7 @@ fn test_t3_07_circuit_breaker_trip_and_cooldown_with_ranking() {
 fn test_t3_08_hosts_population_after_benchmark_completion() {
     let benchmark_results = vec![
         BenchmarkResult {
-            name: "Comss.one Frankfurt".into(),
+            name: "SOCKS5 Frankfurt".into(),
             ip: "83.220.169.155".into(),
             tcp_rtt_ms: 25,
             tls_rtt_ms: 35,
@@ -152,7 +152,7 @@ fn test_t3_08_hosts_population_after_benchmark_completion() {
             is_leader: true,
         },
         BenchmarkResult {
-            name: "Xbox-DNS Anycast".into(),
+            name: "SOCKS5 Global Anycast".into(),
             ip: "111.88.96.50".into(),
             tcp_rtt_ms: 30,
             tls_rtt_ms: 40,

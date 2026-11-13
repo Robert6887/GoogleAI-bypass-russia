@@ -1,12 +1,14 @@
 use std::fs;
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::net::{TcpListener, TcpStream};
+#[cfg(test)]
+use std::net::UdpSocket;
 use std::path::PathBuf;
 
 pub const TCP_BUFFER_SIZE_512K: i32 = 512 * 1024; // 524,288 bytes (512 KB)
 const TCP_BACKUP_NAME: &str = "tcp_backup.conf";
 
 fn tcp_backup_path() -> PathBuf {
-    crate::net::relay::log_dir().join(TCP_BACKUP_NAME)
+    crate::net::config::directory().join(TCP_BACKUP_NAME)
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +255,8 @@ pub fn configure_tcp_listener(listener: &TcpListener) -> Result<(), String> {
 // UDP Socket Utilities (Interface Binding & Buffers)
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub fn bind_socket_to_interface(sock: &UdpSocket, if_index: u32) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
@@ -304,6 +308,7 @@ pub fn bind_socket_to_interface(sock: &UdpSocket, if_index: u32) -> Result<(), S
     }
 }
 
+#[cfg(test)]
 pub fn set_socket_buffers(sock: &UdpSocket, size: i32) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
@@ -549,7 +554,7 @@ fn tcp_tunables() -> &'static [(&'static str, &'static str)] {
     }
 }
 fn tcp_state_path() -> PathBuf {
-    crate::net::relay::log_dir().join("tcp_snapshot.json")
+    crate::net::config::directory().join("tcp_snapshot.json")
 }
 fn capture_tcp() -> Result<TcpSnapshot, String> {
     let mut original = std::collections::BTreeMap::new();
@@ -636,7 +641,7 @@ pub fn tune_os_network_stack() -> Result<Vec<String>, String> {
     }
     if !tcp_state_path().exists() {
         let snapshot = capture_tcp()?;
-        fs::create_dir_all(crate::net::relay::log_dir()).map_err(|e| e.to_string())?;
+        crate::net::config::ensure_directory()?;
         crate::system::fs_utils::robust_write_file(
             &tcp_state_path(),
             &serde_json::to_vec(&snapshot).map_err(|e| e.to_string())?,
@@ -693,10 +698,6 @@ fn restore_tcp_snapshot() -> Result<Vec<String>, String> {
     Ok(vec![
         "Исходные TCP параметры восстановлены и проверены".into()
     ])
-}
-
-pub fn legacy_tcp_pending() -> bool {
-    tcp_backup_path().exists() && !tcp_state_path().exists()
 }
 
 /// Ordinary DNS rollback restores only settings captured by the current engine.
@@ -796,6 +797,7 @@ fn read_legacy_heuristics() -> Option<String> {
 fn restore_legacy_tcp() -> Result<Vec<String>, String> {
     let original =
         parse_legacy_tcp(&fs::read_to_string(tcp_backup_path()).map_err(|e| e.to_string())?)?;
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut current = capture_tcp()?.original;
     #[cfg(windows)]
     if let Some(value) = read_legacy_heuristics() {
@@ -821,6 +823,7 @@ fn restore_legacy_tcp() -> Result<Vec<String>, String> {
             unresolved.push(e);
         }
     }
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut after = capture_tcp()?.original;
     #[cfg(windows)]
     if let Some(value) = read_legacy_heuristics() {
