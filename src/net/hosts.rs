@@ -43,12 +43,34 @@ pub fn remove_entries() -> Result<bool, String> {
     Ok(true)
 }
 
+pub fn has_gate_overrides() -> bool {
+    let p = hosts_path();
+    let Ok(text) = fs::read_to_string(p) else {
+        return false;
+    };
+    strip_legacy_entries(&text).is_ok_and(|stripped| stripped != text)
+}
+
+pub(crate) fn is_legacy_or_gate_host(host: &str) -> bool {
+    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    super::local_proxy::is_gate_host(&h)
+        || matches!(
+            h.as_str(),
+            "makersuite.google.com"
+                | "bard.google.com"
+                | "jules.google.com"
+                | "deepmind.google"
+                | "notebooklm-pa.googleapis.com"
+                | "aisandbox-pa.googleapis.com"
+        )
+}
+
 pub fn strip_legacy_entries(text: &str) -> Result<String, String> {
     let without_block = strip_block(text)?;
     let mut result = String::with_capacity(without_block.len());
     for line in without_block.split_inclusive('\n') {
         let trimmed = line.trim();
-        if is_legacy_bypass_comment(trimmed) || is_gate_loopback_blackhole(trimmed) {
+        if is_legacy_bypass_comment(trimmed) || is_gate_host_override(trimmed) {
             continue;
         }
         result.push_str(line);
@@ -63,7 +85,7 @@ fn is_legacy_bypass_comment(trimmed: &str) -> bool {
         || lower.starts_with("# confeden")
 }
 
-fn is_gate_loopback_blackhole(trimmed: &str) -> bool {
+fn is_gate_host_override(trimmed: &str) -> bool {
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return false;
     }
@@ -72,17 +94,11 @@ fn is_gate_loopback_blackhole(trimmed: &str) -> bool {
     let Some(ip_str) = fields.next() else {
         return false;
     };
-    let Ok(ip) = ip_str.parse::<IpAddr>() else {
-        return false;
-    };
-    if !(ip.is_loopback() || ip.is_unspecified()) {
+    if ip_str.parse::<IpAddr>().is_err() {
         return false;
     }
     let hosts: Vec<&str> = fields.collect();
-    !hosts.is_empty()
-        && hosts
-            .iter()
-            .all(|h| super::local_proxy::is_gate_host(h))
+    !hosts.is_empty() && hosts.iter().all(|h| is_legacy_or_gate_host(h))
 }
 
 fn strip_block(text: &str) -> Result<String, String> {
@@ -177,7 +193,7 @@ mod tests {
     fn strips_legacy_block_and_gate_ipv6_blackholes_while_keeping_user_hosts() {
         let original = "127.0.0.1 localhost\n::1 localhost\n10.0.0.5 internal.corp\n";
         let polluted = format!(
-            "{START_MARK}\n83.220.169.155 cloudcode-pa.googleapis.com\n{END_MARK}\n{original}# AG-BYPASS-HAP: блок IPv6\n::1 daily-cloudcode-pa.googleapis.com\n::1 cloudcode-pa.googleapis.com\n::1 aicode.googleapis.com\n"
+            "{START_MARK}\n83.220.169.155 cloudcode-pa.googleapis.com\n{END_MARK}\n{original}# AG-BYPASS-HAP: блок IPv6\n::1 daily-cloudcode-pa.googleapis.com\n::1 cloudcode-pa.googleapis.com\n::1 aicode.googleapis.com\n45.155.204.190 gemini.google.com robinfrontend-pa.googleapis.com\n193.233.112.67 makersuite.google.com\n"
         );
         assert_eq!(strip_legacy_entries(&polluted).unwrap(), original);
         assert!(strip_block(&format!("{START_MARK}\nunterminated")).is_err());

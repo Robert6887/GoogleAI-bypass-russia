@@ -571,9 +571,11 @@ fn legacy_cli_backup_matches(original: &[u8], current: &[u8]) -> bool {
 
 fn legacy_backup_paths(path: &Path) -> Vec<std::path::PathBuf> {
     let mut paths = vec![path.with_extension("bak"), path.with_extension("original")];
-    let mut appended = path.as_os_str().to_os_string();
-    appended.push(".bak");
-    paths.push(appended.into());
+    for suffix in [".bak", ".orig", ".original"] {
+        let mut appended = path.as_os_str().to_os_string();
+        appended.push(suffix);
+        paths.push(appended.into());
+    }
     paths
 }
 

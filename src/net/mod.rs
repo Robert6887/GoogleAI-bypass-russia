@@ -11,7 +11,7 @@ pub mod proxy_session;
 pub mod socket;
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(super) struct ConfigurationLock(fs::File);
 
@@ -105,6 +105,9 @@ pub fn clean_legacy_network(deep_third_party: bool) -> Result<Vec<String>, Strin
 
     #[cfg(target_os = "macos")]
     {
+        if let Some(note) = gemini_apps::clean_google_proxy_bypass_domains() {
+            cleaned.push(note);
+        }
         match clean_resolver_directory(Path::new("/etc/resolver"), deep_third_party) {
             Ok(count) if count > 0 => {
                 cleaned.push(format!("очищено объектов в /etc/resolver: {count}"))
@@ -135,26 +138,95 @@ pub fn clean_legacy_network(deep_third_party: bool) -> Result<Vec<String>, Strin
     }
 }
 
+pub fn resolver_has_gate_files() -> bool {
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(entries) = fs::read_dir("/etc/resolver") else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            entry.path().is_file()
+                && hosts::is_legacy_or_gate_host(&entry.file_name().to_string_lossy())
+        })
+    }
+}
+
+pub fn legacy_daemon_present() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        [
+            "/Library/LaunchDaemons/com.antigravity.bypass.russia.plist",
+            "/Library/LaunchDaemons/com.antigravity.bypass.watchdog.plist",
+            "/Library/LaunchDaemons/com.antigravity.bypass.dns.plist",
+            "/Library/LaunchDaemons/com.antigravity.bypass.plist",
+        ]
+        .iter()
+        .any(|p| Path::new(p).exists())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        crate::system::command::output("schtasks", ["/Query", "/TN", "AntigravityBypassRussia"])
+            .is_ok_and(|o| o.status.success())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        false
+    }
+}
+
 fn stop_legacy_dns_daemon() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
-        let plist = Path::new("/Library/LaunchDaemons/com.antigravity.bypass.russia.plist");
+        let labels = [
+            "com.antigravity.bypass.russia",
+            "com.antigravity.bypass.watchdog",
+            "com.antigravity.bypass.dns",
+            "com.antigravity.bypass",
+        ];
         let daemon_bin = Path::new("/Library/Application Support/AntigravityBypassRussia/ag_dns");
-        if !plist.exists() && !daemon_bin.exists() {
-            return None;
+        let mut stopped = Vec::new();
+        for label in labels {
+            let plist = PathBuf::from(format!("/Library/LaunchDaemons/{label}.plist"));
+            if !plist.exists() {
+                continue;
+            }
+            let _ = crate::system::command::output("launchctl", ["bootout", &format!("system/{label}")]);
+            let _ = crate::system::command::output(
+                "launchctl",
+                ["unload", "-w", &plist.to_string_lossy()],
+            );
+            let _ = crate::system::journal::restore(&plist).or_else(|_| {
+                fs::remove_file(&plist)
+                    .map(|_| true)
+                    .map_err(|e| e.to_string())
+            });
+            stopped.push(label);
         }
-        let _ = crate::system::command::output(
-            "launchctl",
-            ["bootout", "system/com.antigravity.bypass.russia"],
-        );
-        let _ = crate::system::command::output("launchctl", ["unload", "-w", &plist.to_string_lossy()]);
-        if plist.exists() {
-            let _ = crate::system::journal::restore(plist).or_else(|_| fs::remove_file(plist).map(|_| true).map_err(|e| e.to_string()));
+        if daemon_bin.exists() && fs::remove_file(daemon_bin).is_ok() && stopped.is_empty() {
+            stopped.push("ag_dns");
         }
-        if daemon_bin.exists() {
-            let _ = fs::remove_file(daemon_bin);
+        if let Ok(uid) = local_proxy::user_id() {
+            let _ = crate::system::command::output(
+                "launchctl",
+                [
+                    "asuser",
+                    &uid.to_string(),
+                    "/bin/launchctl",
+                    "unsetenv",
+                    "GRPC_DNS_RESOLVER",
+                ],
+            );
         }
-        Some("остановлен и удалён старый DNS-демон com.antigravity.bypass.russia".into())
+        (!stopped.is_empty()).then(|| {
+            format!(
+                "остановлены и удалены старые фоновые демоны ({})",
+                stopped.join(", ")
+            )
+        })
     }
     #[cfg(target_os = "windows")]
     {
@@ -182,7 +254,7 @@ fn stop_legacy_dns_daemon() -> Option<String> {
     }
 }
 
-pub(crate) fn clean_resolver_directory(dir: &Path, clean_orphaned_backups: bool) -> Result<usize, String> {
+pub(crate) fn clean_resolver_directory(dir: &Path, deep_third_party: bool) -> Result<usize, String> {
     if !dir.exists() {
         return Ok(0);
     }
@@ -191,9 +263,12 @@ pub(crate) fn clean_resolver_directory(dir: &Path, clean_orphaned_backups: bool)
     for entry in entries.flatten() {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
-        if path.is_file() && local_proxy::is_gate_host(&name) {
+        if path.is_file() && hosts::is_legacy_or_gate_host(&name) {
             let text = fs::read_to_string(&path).unwrap_or_default();
-            if text.contains("Antigravity-Bypass") || crate::system::journal::has_record(&path) {
+            if deep_third_party
+                || text.contains("Antigravity")
+                || crate::system::journal::has_record(&path)
+            {
                 if crate::system::journal::has_record(&path) {
                     let _ = crate::system::journal::restore(&path);
                 }
@@ -203,9 +278,9 @@ pub(crate) fn clean_resolver_directory(dir: &Path, clean_orphaned_backups: bool)
                     removed += 1;
                 }
             }
-        } else if clean_orphaned_backups && path.is_dir() {
+        } else if deep_third_party && path.is_dir() {
             if let Some(domain) = name.strip_suffix(".ag-backups") {
-                if local_proxy::is_gate_host(domain) && !dir.join(domain).exists() {
+                if hosts::is_legacy_or_gate_host(domain) && !dir.join(domain).exists() {
                     if fs::remove_dir_all(&path).is_ok() {
                         removed += 1;
                     }
@@ -225,6 +300,25 @@ fn clean_macos_third_party_dirs() -> Vec<String> {
     let confeden_dir = Path::new("/Library/Application Support/AntigravityBypass");
     if confeden_dir.exists() {
         let mut removed_any = false;
+        let routes_json = confeden_dir.join("owned_routes_macos.json");
+        if let Ok(bytes) = fs::read(&routes_json) {
+            if let Ok(items) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) {
+                for item in items {
+                    if let Some(ip) = item.get("ip").and_then(|v| v.as_str()) {
+                        if ip.parse::<std::net::Ipv4Addr>().is_ok() {
+                            let _ = crate::system::command::output(
+                                "/sbin/route",
+                                ["-n", "delete", "-host", ip],
+                            );
+                        }
+                    }
+                }
+                let _ = crate::system::command::output(
+                    "networksetup",
+                    ["-setadditionalroutes", "Wi-Fi"],
+                );
+            }
+        }
         for file in [
             "iface.conf",
             "known_good_ips.json",
@@ -232,6 +326,8 @@ fn clean_macos_third_party_dirs() -> Vec<String> {
             "upstream.conf",
             "watchdog.log",
             "ag_dns",
+            "owned_routes_macos.json",
+            "macos-instant-fix.py",
         ] {
             let target = confeden_dir.join(file);
             if target.exists() && fs::remove_file(&target).is_ok() {
@@ -299,14 +395,20 @@ mod tests {
             "# Antigravity-Bypass\nnameserver 127.0.0.1\n",
         )
         .unwrap();
+        fs::write(
+            resolver.join("makersuite.google.com"),
+            "nameserver 45.155.204.190\n",
+        )
+        .unwrap();
         let orphan = resolver.join("daily-cloudcode-pa.googleapis.com.ag-backups");
         fs::create_dir_all(&orphan).unwrap();
         fs::write(orphan.join("legacy.json"), "{}").unwrap();
         fs::write(resolver.join("corp.internal"), "nameserver 10.0.0.53\n").unwrap();
 
         let count = clean_resolver_directory(&resolver, true).unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
         assert!(!resolver.join("gemini.google.com").exists());
+        assert!(!resolver.join("makersuite.google.com").exists());
         assert!(!orphan.exists());
         assert!(resolver.join("corp.internal").exists());
     }

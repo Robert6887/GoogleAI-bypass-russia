@@ -34,6 +34,7 @@ fn print_help() {
           patch-files           Пропатчить только бинарники Antigravity [необязательный путь]\n\
           tune                  Оптимизация буферов сетевого стека TCP\n\
           diagnostics           Запустить интерактивный чекер подключения\n\
+          ai-help               Скопировать в буфер обмена готовый запрос для ИИ (OpenCode / Kimi / ChatGPT)\n\
           report                Сохранить обезличенный JSON-отчёт диагностики [каталог]\n\n\
         Опции:\n\
           -h, --help            Показать эту справку\n\
@@ -135,6 +136,10 @@ fn main() {
     }
     if command == "diagnostics" && args.len() == 2 {
         let ok = ui::menu::handle_diagnostics();
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+    if command == "ai-help" && args.len() == 2 {
+        let ok = ui::menu::handle_ai_help();
         std::process::exit(if ok { 0 } else { 1 });
     }
     if command == "report" && args.len() <= 3 {

@@ -23,7 +23,9 @@
   - Параллельная проверка `Antigravity Daily`, `Antigravity Prod`, `Gemini Web (/app)`, `Google AI Studio`, `Gemini Desktop` и `Gemini в Chrome` с замером пинга (мс) и распознаванием региональных редиректов Google (`unsupported` / `/faq`). Позволяет проверить любой новый прокси сразу после покупки без перезаписи текущих настроек.
 - **Глубокий чистый откат до заводского состояния (`[4]`) и удаление SmartDNS / бесплатных прокси**:
   - Полностью вырезаны все публичные DNS-обходы (`DNS-AI.RU`, `Comss.one`, `Geohide.ru`, `Xbox-DNS`, `sni-direct`), порт-53 релей и встроенные бесплатные выходы.
-  - Полный откат (`[4]` / `sudo ag-bypass rollback`) восстанавливает эталонные файлы из `.ag-backups/<sha256>.bin`, откатывает системный PAC и `Local State` в Chrome, а также вычищает системные хвосты прошлых/сторонних кряков (`/etc/hosts`, `/etc/resolver/*.ag-backups`, старые демоны `watchdog` / `ag_dns`, `/Library/Application Support/AntigravityBypass`), не затрагивая чаты, воркспейсы и пользовательские данные.
+  - Полный откат (`[4]` / `sudo ag-bypass rollback`) восстанавливает эталонные файлы из `.ag-backups/<sha256>.bin`, откатывает системный PAC и `Local State` в Chrome, а также вычищает системные хвосты прошлых/сторонних кряков (`/etc/hosts`, `/etc/resolver/*`, `ProxyBypassDomains`, старые демоны `watchdog` / `ag_dns`, `/Library/Application Support/AntigravityBypass`), не затрагивая чаты, воркспейсы и пользовательские данные.
+- **Диагностика для ИИ в 1 клик (`ai-help` / `[5]`) и портативный навык `SKILL.md`**:
+  - Команда `ag-bypass ai-help` и пункт `[5]` собирают обезличенный отчёт без паролей и IP прокси и копируют готовый запрос прямо в буфер обмена (`⌘V` / `Ctrl+V` для Kimi, OpenCode, ChatGPT, Claude), а навык `skills/antigravity-diagnostics/SKILL.md` позволяет ИИ-агентам диагностировать поломки автоматически.
 
 ---
 
@@ -81,7 +83,7 @@
 
 - Ускорена работа DNS и внедрен DoH `dns-ai.ru` поверх HTTP/2.
 - Исправлены конфликты DNS-настроек на macOS.
-- Добавлена изоляция от корпоративных VPN (`NetBird`, `FortiClient`, `Happ`).
+- Добавлена изоляция маршрутов от виртуальных VPN-туннелей.
 - Предотвращение утечки IPv6 для десктопного `Gemini.app`.
 - Добавлен фоновый Watchdog LaunchDaemon.
 

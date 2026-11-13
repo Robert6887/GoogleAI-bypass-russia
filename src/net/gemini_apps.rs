@@ -110,6 +110,120 @@ fn save_pac_backup(backup: &PacBackup) -> Result<(), String> {
     super::config::inherit_directory_owner(&path)
 }
 
+pub fn is_google_proxy_bypass_entry(entry: &str) -> bool {
+    let lower = entry.trim().trim_end_matches('.').to_ascii_lowercase();
+    let host = lower.strip_prefix("*.").unwrap_or(&lower);
+    matches!(
+        host,
+        "googleapis.com"
+            | "gemini.google.com"
+            | "aistudio.google.com"
+            | "clients6.google.com"
+            | "ai.google.dev"
+            | "makersuite.google.com"
+            | "notebooklm.google.com"
+    ) || super::hosts::is_legacy_or_gate_host(host)
+}
+
+/// Remove only Google AI domains injected into macOS `ProxyBypassDomains` by
+/// older SmartDNS scripts so CFNetwork and Chromium do not skip `/proxy.pac`.
+/// Returns `Some(cleaned_list)` only when at least one Google AI domain was removed.
+pub fn filter_google_proxy_bypass_domains(raw_text: &str) -> Option<Vec<String>> {
+    let existing: Vec<String> = raw_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.contains("aren't any"))
+        .map(ToOwned::to_owned)
+        .collect();
+    let mut cleaned: Vec<String> = existing
+        .iter()
+        .filter(|entry| !is_google_proxy_bypass_entry(entry))
+        .cloned()
+        .collect();
+    if cleaned.len() == existing.len() {
+        return None;
+    }
+    if cleaned.is_empty() {
+        cleaned.push("*.local".to_string());
+        cleaned.push("169.254/16".to_string());
+    }
+    Some(cleaned)
+}
+
+pub fn proxy_bypass_blocks_google() -> bool {
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(order) = crate::system::command::output("networksetup", ["-listnetworkserviceorder"])
+        else {
+            return false;
+        };
+        if !order.status.success() {
+            return false;
+        }
+        for service in parse_pac_services(&String::from_utf8_lossy(&order.stdout)) {
+            if let Ok(out) = crate::system::command::output(
+                "networksetup",
+                ["-getproxybypassdomains", service.as_str()],
+            ) {
+                if out.status.success()
+                    && filter_google_proxy_bypass_domains(&String::from_utf8_lossy(&out.stdout))
+                        .is_some()
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+pub fn clean_google_proxy_bypass_domains() -> Option<String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let order =
+            crate::system::command::output("networksetup", ["-listnetworkserviceorder"]).ok()?;
+        if !order.status.success() {
+            return None;
+        }
+        let mut cleaned_services = 0usize;
+        for service in parse_pac_services(&String::from_utf8_lossy(&order.stdout)) {
+            let Ok(out) = crate::system::command::output(
+                "networksetup",
+                ["-getproxybypassdomains", service.as_str()],
+            ) else {
+                continue;
+            };
+            if !out.status.success() {
+                continue;
+            }
+            if let Some(cleaned) =
+                filter_google_proxy_bypass_domains(&String::from_utf8_lossy(&out.stdout))
+            {
+                let mut args = vec!["-setproxybypassdomains".to_string(), service];
+                args.extend(cleaned);
+                if crate::system::command::output("networksetup", args)
+                    .is_ok_and(|r| r.status.success())
+                {
+                    cleaned_services += 1;
+                }
+            }
+        }
+        (cleaned_services > 0).then(|| {
+            format!(
+                "удалены исключения Google AI из ProxyBypassDomains ({cleaned_services} служб)"
+            )
+        })
+    }
+}
+
 pub fn enable_system_pac(pac_url: &str) -> Result<Vec<String>, String> {
     if !is_managed_pac_url(pac_url) {
         return Err("Системный PAC должен указывать на локальный 127.0.0.1".into());
@@ -121,6 +235,7 @@ pub fn enable_system_pac(pac_url: &str) -> Result<Vec<String>, String> {
     }
     #[cfg(target_os = "macos")]
     {
+        let _ = clean_google_proxy_bypass_domains();
         let order = crate::system::command::output("networksetup", ["-listnetworkserviceorder"])
             .map_err(|e| e.to_string())?;
         if !order.status.success() {
@@ -207,46 +322,78 @@ pub fn disable_system_pac() -> Result<(), String> {
     return Ok(());
     #[cfg(target_os = "macos")]
     {
-        let Some(backup) = load_pac_backup()? else {
-            return Ok(());
-        };
+        let backup = load_pac_backup()?;
         let mut errors = Vec::new();
-        for (service, orig) in &backup.services {
-            let Ok(current_out) = crate::system::command::output(
-                "networksetup",
-                ["-getautoproxyurl", service.as_str()],
-            ) else {
-                continue;
-            };
-            if !current_out.status.success() {
-                continue;
-            }
-            let (cur_url, cur_enabled) =
-                parse_autoproxy(&String::from_utf8_lossy(&current_out.stdout));
-            if cur_enabled
-                && !cur_url.as_deref().is_some_and(is_managed_pac_url)
-                && cur_url != orig.url
-            {
-                // User configured another PAC afterwards; leave it intact.
-                continue;
-            }
-            if let Some(orig_url) = &orig.url {
-                let _ = crate::system::command::output(
+        let mut handled_services = std::collections::BTreeSet::new();
+        if let Some(backup) = &backup {
+            for (service, orig) in &backup.services {
+                handled_services.insert(service.clone());
+                let Ok(current_out) = crate::system::command::output(
                     "networksetup",
-                    ["-setautoproxyurl", service.as_str(), orig_url.as_str()],
-                );
+                    ["-getautoproxyurl", service.as_str()],
+                ) else {
+                    continue;
+                };
+                if !current_out.status.success() {
+                    continue;
+                }
+                let (cur_url, cur_enabled) =
+                    parse_autoproxy(&String::from_utf8_lossy(&current_out.stdout));
+                if cur_enabled
+                    && !cur_url.as_deref().is_some_and(is_managed_pac_url)
+                    && cur_url != orig.url
+                {
+                    // User configured another PAC afterwards; leave it intact.
+                    continue;
+                }
+                if let Some(orig_url) = &orig.url {
+                    let _ = crate::system::command::output(
+                        "networksetup",
+                        ["-setautoproxyurl", service.as_str(), orig_url.as_str()],
+                    );
+                }
+                let desired_state = if orig.enabled { "on" } else { "off" };
+                match crate::system::command::output(
+                    "networksetup",
+                    ["-setautoproxystate", service.as_str(), desired_state],
+                ) {
+                    Ok(out) if out.status.success() => {}
+                    Ok(out) => errors.push(format!(
+                        "{service}: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    )),
+                    Err(e) => errors.push(format!("{service}: {e}")),
+                }
             }
-            let desired_state = if orig.enabled { "on" } else { "off" };
-            match crate::system::command::output(
-                "networksetup",
-                ["-setautoproxystate", service.as_str(), desired_state],
-            ) {
-                Ok(out) if out.status.success() => {}
-                Ok(out) => errors.push(format!(
-                    "{service}: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                )),
-                Err(e) => errors.push(format!("{service}: {e}")),
+        }
+        // Also turn off any orphaned 127.0.0.1:<port>/proxy.pac left on active
+        // services when our backup file was absent (e.g., third-party local PAC).
+        if let Ok(order) =
+            crate::system::command::output("networksetup", ["-listnetworkserviceorder"])
+        {
+            if order.status.success() {
+                for service in parse_pac_services(&String::from_utf8_lossy(&order.stdout)) {
+                    if handled_services.contains(&service) {
+                        continue;
+                    }
+                    let Ok(current_out) = crate::system::command::output(
+                        "networksetup",
+                        ["-getautoproxyurl", service.as_str()],
+                    ) else {
+                        continue;
+                    };
+                    if !current_out.status.success() {
+                        continue;
+                    }
+                    let (cur_url, cur_enabled) =
+                        parse_autoproxy(&String::from_utf8_lossy(&current_out.stdout));
+                    if cur_enabled && cur_url.as_deref().is_some_and(is_managed_pac_url) {
+                        let _ = crate::system::command::output(
+                            "networksetup",
+                            ["-setautoproxystate", service.as_str(), "off"],
+                        );
+                    }
+                }
             }
         }
         if errors.is_empty() {
@@ -642,16 +789,59 @@ pub fn unlock_chrome_glic() -> Result<usize, String> {
     Ok(profiles)
 }
 
+fn clear_chrome_seed_cache() {
+    let chrome_dir = chrome_user_data_dir();
+    for seed_name in ["VariationsSeedV2", "VariationsSafeSeedV2"] {
+        let seed = chrome_dir.join(seed_name);
+        if seed.is_file() {
+            let _ = fs::remove_file(seed);
+        }
+    }
+}
+
+/// Reset unbacked `Local State` country overrides so Chrome re-detects its natural
+/// regional Variations seed on next startup.
+pub fn reset_unbacked_local_state_json(root: &mut serde_json::Value) -> bool {
+    let Some(obj) = root.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for key in CHROME_COUNTRY_KEYS {
+        if obj.remove(key).is_some() {
+            changed = true;
+        }
+    }
+    if let Some(cache) = obj
+        .get_mut("profile")
+        .and_then(|p| p.as_object_mut())
+        .and_then(|p| p.get_mut("info_cache"))
+        .and_then(|c| c.as_object_mut())
+    {
+        for info in cache.values_mut() {
+            if let Some(info_obj) = info.as_object_mut() {
+                if info_obj.remove("is_glic_eligible").is_some() {
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
 pub fn restore_chrome_glic() -> Result<(), String> {
     let Some(backup) = load_chrome_backup()? else {
         return Ok(());
     };
     let state_path = chrome_local_state_path();
-    if state_path.is_file() && !chrome_running() {
+    if state_path.is_file() {
+        if chrome_running() {
+            quit_chrome()?;
+        }
         let bytes = fs::read(&state_path).map_err(|e| e.to_string())?;
         if let Ok(mut root) = serde_json::from_slice::<serde_json::Value>(&bytes) {
             restore_local_state_json(&mut root, &backup)?;
             write_chrome_json(&state_path, &root)?;
+            clear_chrome_seed_cache();
         }
     }
     match fs::remove_file(chrome_glic_backup_path()) {
@@ -659,6 +849,27 @@ pub fn restore_chrome_glic() -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.to_string()),
     }
+}
+
+pub fn reset_third_party_chrome_glic() -> Result<bool, String> {
+    if chrome_glic_backup_path().is_file() {
+        return Ok(false);
+    }
+    let state_path = chrome_local_state_path();
+    if !state_path.is_file() || chrome_glic_needs_unlock() {
+        return Ok(false);
+    }
+    if chrome_running() {
+        quit_chrome()?;
+    }
+    let bytes = fs::read(&state_path).map_err(|e| e.to_string())?;
+    let mut root: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    if !reset_unbacked_local_state_json(&mut root) {
+        return Ok(false);
+    }
+    write_chrome_json(&state_path, &root)?;
+    clear_chrome_seed_cache();
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -751,5 +962,38 @@ An asterisk (*) denotes that a network service is disabled.
             false
         );
         assert_eq!(state["browser"]["new_pref"], "preserved");
+    }
+
+    #[test]
+    fn strips_google_entries_from_proxy_bypass_domains_and_preserves_custom_ones() {
+        let polluted = "*.local\n169.254/16\n*.googleapis.com\ngemini.google.com\ncorp.internal\n";
+        assert_eq!(
+            filter_google_proxy_bypass_domains(polluted),
+            Some(vec![
+                "*.local".to_string(),
+                "169.254/16".to_string(),
+                "corp.internal".to_string()
+            ])
+        );
+        assert_eq!(
+            filter_google_proxy_bypass_domains("*.local\n169.254/16\ncorp.internal\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn resets_unbacked_third_party_local_state_while_preserving_browser_prefs() {
+        let mut state = serde_json::json!({
+            "variations_country": "us",
+            "variations_permanent_consistency_country": ["157.0.0.1", "us"],
+            "browser": { "tab": 7 },
+            "profile": { "info_cache": { "Default": { "name": "Main", "is_glic_eligible": true } } }
+        });
+        assert!(reset_unbacked_local_state_json(&mut state));
+        assert!(state.get("variations_country").is_none());
+        assert!(state["profile"]["info_cache"]["Default"]
+            .get("is_glic_eligible")
+            .is_none());
+        assert_eq!(state["browser"]["tab"], 7);
     }
 }

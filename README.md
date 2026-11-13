@@ -104,10 +104,26 @@ ag-bypass vpn bypass
 # Разблокировать кнопку «Спросить Gemini» в Chrome
 ag-bypass chrome-gemini
 
-# Проверка доступности и полный чистый откат
+# Проверка доступности, диагностика для ИИ и полный чистый откат
 ag-bypass doctor
+ag-bypass ai-help
 sudo ag-bypass rollback
 ```
+
+---
+
+## Если что-то сломалось: диагностика через ИИ (OpenCode / Kimi / ChatGPT / Claude)
+
+Даже если вы не разбираетесь в разработке, любую поломку можно решить за 1 минуту с помощью любой языковой модели:
+
+1. **Через любой обычный ИИ-чат (Kimi, ChatGPT, Claude, DeepSeek)**:
+   Запустите в Терминале одну команду (или выберите пункт `[5]` в меню):
+   ```bash
+   curl -fsSL https://github.com/Robert6887/GoogleAI-bypass-russia/releases/latest/download/unlock_and_restore.sh | bash -s -- ai-help
+   ```
+   Утилита соберёт безопасный отчёт **без паролей, IP прокси и личных путей** и **сама скопирует готовый запрос в буфер обмена** — просто откройте чат с ИИ и нажмите `⌘V` (`Ctrl+V`).
+2. **Через ИИ-агента на компьютере (OpenCode, Kimi CLI, Claude Code, Cursor)**:
+   В репозитории лежит готовый навык [`skills/antigravity-diagnostics/SKILL.md`](skills/antigravity-diagnostics/SKILL.md). Достаточно подключить его в папку скиллов вашего агента (или дать агенту прочитать этот файл) и написать: *«Продиагностируй, почему не работает Antigravity»*.
 
 ---
 

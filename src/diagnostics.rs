@@ -202,11 +202,17 @@ fn installations() -> Value {
                     versions.insert(v);
                 }
             }
+            let proxy_env = matches!(
+                target.kind,
+                detector::TargetKind::LanguageServer | detector::TargetKind::AgyCli
+            )
+            .then(|| inspected && patcher::proxy_env_ready(&target));
             targets.push(json!({
                 "component": format!("{:?}", target.kind),
                 "size_bytes": size,
                 "architecture": binary_architecture(&target.path),
-                "patch_state": state
+                "patch_state": state,
+                "proxy_env_ready": proxy_env
             }));
         }
         if !targets.is_empty() || !versions.is_empty() {
@@ -303,12 +309,26 @@ fn gateway_summary() -> Value {
     })
 }
 
+fn legacy_conflicts() -> Value {
+    json!({
+        "status": "ok",
+        "hosts_has_gate_overrides": net::hosts::has_gate_overrides(),
+        "resolver_has_gate_files": net::resolver_has_gate_files(),
+        "legacy_daemon_present": net::legacy_daemon_present(),
+        "proxy_bypass_blocks_google": net::gemini_apps::proxy_bypass_blocks_google(),
+        "system_pac_active": net::gemini_apps::pac_active(),
+        "chrome_glic_unlocked": net::gemini_apps::chrome_installed()
+            .then(|| !net::gemini_apps::chrome_glic_needs_unlock()),
+    })
+}
+
 pub fn collect() -> Value {
     let started = net::config::now_ms();
     let route_ips: Vec<Ipv4Addr> = Vec::new();
     let mut jobs: Vec<(String, Box<dyn FnOnce() -> Value + Send>)> = vec![
         ("installations".into(), Box::new(installations)),
         ("gateway".into(), Box::new(gateway_summary)),
+        ("legacy_conflicts".into(), Box::new(legacy_conflicts)),
         (
             "autopatch".into(),
             Box::new(|| json!({"status": "ok", "enabled": autopatch::is_enabled()})),
@@ -383,6 +403,107 @@ pub fn save(directory: Option<&Path>) -> Result<PathBuf, String> {
     }
     let directory = fs::canonicalize(directory).map_err(|e| e.to_string())?;
     write_report(&directory, &collect())
+}
+
+pub fn build_ai_prompt(report: &Value) -> String {
+    let cfg = net::proxy_config::load().unwrap_or_default();
+    let live_checks: Vec<Value> =
+        net::local_proxy::check_all_products(cfg.upstream.as_ref(), cfg.vpn_policy)
+            .into_iter()
+            .map(|c| {
+                json!({
+                    "service": c.name,
+                    "ok": c.ok,
+                    "geo_blocked": c.geo_blocked,
+                })
+            })
+            .collect();
+    let payload = json!({
+        "live_google_endpoints": live_checks,
+        "diagnostics": report,
+    });
+    let pretty = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into());
+    format!(
+        "Помоги мне починить работу Google Antigravity / Gemini на моём компьютере.\n\
+Я НЕ программист — пожалуйста, объясни простым человеческим языком на русском, что именно сейчас сломано и какой один пункт меню мне нажать.\n\n\
+Контекст архитектуры утилиты GoogleAI-bypass-russia (v{}):\n\
+1. Antigravity IDE/CLI: бинарники должны иметь `patch_state: \"Patched\"` и `proxy_env_ready: true` (`AG_LS_PROXY`).\n\
+2. Локальный шлюз (`gateway.listener_alive: true`): принимает трафик на `127.0.0.1:<port>` и отправляет в зарубежный SOCKS5/HTTP прокси пользователя (`proxy.upstream_configured: true`).\n\
+3. Gemini Desktop и Gemini Web: работают через системный PAC (`legacy_conflicts.system_pac_active: true`). Если `hosts_has_gate_overrides`, `resolver_has_gate_files`, `legacy_daemon_present` или `proxy_bypass_blocks_google` равны `true`, старый сторонний обходчик мешает трафику.\n\
+4. Кнопка «Спросить Gemini» в Chrome: требует `chrome_glic_unlocked: true` (при закрытом Chrome) и личного аккаунта `@gmail.com`.\n\
+5. Как запустить меню утилиты одной командой в Терминале macOS:\n\
+   `curl -fsSL https://github.com/Robert6887/GoogleAI-bypass-russia/releases/latest/download/unlock_and_restore.sh | bash`\n\
+   Пункты меню: `[1]` Настроить разблокировку и очистить конфликты, `[2]` Добавить/сменить прокси или переключить маршрут VPN, `[3]` Чекер прокси, `[4]` Полный откат к заводским настройкам.\n\n\
+Обезличенный JSON-отчёт диагностики (пароли, IP прокси и личные пути удалены):\n\
+```json\n\
+{pretty}\n\
+```\n",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+pub fn copy_to_clipboard(text: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::{Command, Stdio};
+        let mut cmd = if unsafe { libc::geteuid() } == 0 {
+            if let Ok(uid) = net::local_proxy::user_id() {
+                let mut c = Command::new("/bin/launchctl");
+                c.args(["asuser", &uid.to_string(), "/usr/bin/pbcopy"]);
+                c
+            } else {
+                Command::new("/usr/bin/pbcopy")
+            }
+        } else {
+            Command::new("/usr/bin/pbcopy")
+        };
+        if let Ok(mut child) = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            return child.wait().is_ok_and(|s| s.success());
+        }
+        false
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::{Command, Stdio};
+        if let Ok(mut child) = Command::new("clip.exe")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            return child.wait().is_ok_and(|s| s.success());
+        }
+        false
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = text;
+        false
+    }
+}
+
+pub fn save_ai_prompt(report: &Value) -> Result<(PathBuf, bool), String> {
+    net::config::ensure_directory()?;
+    let prompt_text = build_ai_prompt(report);
+    let copied = copy_to_clipboard(&prompt_text);
+    let path = net::config::directory().join("antigravity-ai-prompt.txt");
+    system::fs_utils::robust_write_file(&path, prompt_text.as_bytes())?;
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        let _ = net::config::inherit_directory_owner(&path);
+    }
+    Ok((path, copied))
 }
 
 #[cfg(test)]

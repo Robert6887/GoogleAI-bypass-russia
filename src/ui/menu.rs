@@ -496,10 +496,10 @@ pub fn handle_proxy_enable() -> bool {
     }
 
     if ok {
-        match clean_legacy_network(false) {
+        match clean_legacy_network(true) {
             Ok(notes) => {
                 for note in notes {
-                    println!("  \x1b[92m✓\x1b[0m Очистка старых сетевых заглушек: {note}");
+                    println!("  \x1b[92m✓\x1b[0m Очистка конфликтующих следов: {note}");
                 }
             }
             Err(error) => println!("  \x1b[93m!\x1b[0m Предупреждение очистки старых DNS: {error}"),
@@ -852,6 +852,7 @@ pub fn handle_rollback() -> bool {
         println!("  \x1b[92m✓\x1b[0m Автопатч отключён");
     }
 
+    let mut missing_third_party_backup = false;
     for root in installs {
         let targets = find_targets_in_path(&root);
         if targets.is_empty() && std::env::args().nth(2).is_some() {
@@ -877,6 +878,9 @@ pub fn handle_rollback() -> bool {
                             target.name
                         );
                     } else {
+                        if error.contains("Нет backup") {
+                            missing_third_party_backup = true;
+                        }
                         ok &= print_patch_result(&target, Err(error));
                     }
                 }
@@ -901,6 +905,9 @@ pub fn handle_rollback() -> bool {
         ok = false;
     } else {
         println!("  \x1b[92m✓\x1b[0m Локальный шлюз, системный PAC и настройки Chrome возвращены к исходным");
+    }
+    if let Ok(true) = gemini_apps::reset_third_party_chrome_glic() {
+        println!("  \x1b[92m✓\x1b[0m Сброшены сторонние флаги региона в Google Chrome");
     }
 
     match clean_legacy_network(true) {
@@ -932,6 +939,12 @@ pub fn handle_rollback() -> bool {
         }
     }
 
+    if missing_third_party_backup {
+        println!(
+            "\n  \x1b[93mПодсказка:\x1b[0m все сетевые настройки, системный PAC, hosts и фоновые службы очищены.\n  Если сам файл Antigravity ранее изменялся сторонним патчером без сохранения резервной копии (.bak),\n  просто скачайте свежий Antigravity и перетащите поверх в Программы — ваши чаты и воркспейсы сохранятся."
+        );
+    }
+
     if ok {
         println!("\n  \x1b[92mПолный откат завершён. Система приведена в исходное состояние!\x1b[0m");
     } else {
@@ -942,12 +955,64 @@ pub fn handle_rollback() -> bool {
     ok
 }
 
+pub fn handle_ai_help() -> bool {
+    println!("\n  Собираем полную диагностику для языковой модели (OpenCode / Kimi / ChatGPT / Claude)…");
+    let report = crate::diagnostics::collect();
+    match crate::diagnostics::save_ai_prompt(&report) {
+        Ok((prompt_path, copied)) => {
+            if copied {
+                println!(
+                    "\n  \x1b[92m✓\x1b[0m Готовый запрос для нейросети скопирован прямо в буфер обмена!"
+                );
+                println!(
+                    "    Откройте \x1b[1mKimi, OpenCode, ChatGPT или Claude\x1b[0m и просто нажмите \x1b[96m⌘V (Ctrl+V)\x1b[0m."
+                );
+            }
+            println!(
+                "  \x1b[92m✓\x1b[0m Текстовый файл с запросом для ИИ сохранён:\n    {}",
+                display_path(&prompt_path)
+            );
+            println!("    (Пароли прокси, IP-адреса прокси и личные пути полностью удалены.)");
+            pause();
+            true
+        }
+        Err(error) => {
+            eprintln!("  Не удалось подготовить запрос для ИИ: {error}");
+            pause();
+            false
+        }
+    }
+}
+
 pub fn handle_save_diagnostics(directory: Option<&Path>) -> bool {
     println!("\n  Собираем отчёт диагностики (без паролей прокси и личных данных)…");
     let ok = match crate::diagnostics::save(directory) {
         Ok(path) => {
             println!("\n  Диагностика сохранена:\n  {}", display_path(&path));
-            println!("\n  Файл можно приложить к обращению или Issue.");
+            if directory.is_none() {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    if let Ok(report) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        if let Ok((prompt_path, copied)) =
+                            crate::diagnostics::save_ai_prompt(&report)
+                        {
+                            if copied {
+                                println!(
+                                    "\n  \x1b[92m✓\x1b[0m Готовый запрос для ИИ скопирован в буфер обмена!"
+                                );
+                                println!(
+                                    "    Просто откройте \x1b[1mKimi, OpenCode, ChatGPT или Claude\x1b[0m и нажмите \x1b[96m⌘V (Ctrl+V)\x1b[0m."
+                                );
+                            }
+                            println!(
+                                "  \x1b[90mТекст запроса также сохранён: {}\x1b[0m",
+                                display_path(&prompt_path)
+                            );
+                        }
+                    }
+                }
+            } else {
+                println!("\n  Файл можно приложить к обращению или Issue.");
+            }
             true
         }
         Err(error) => {
@@ -969,7 +1034,7 @@ pub fn run_app() {
         println!("  \x1b[96m[2]\x1b[0m  Прокси и работа с VPN (добавить SOCKS5/HTTP, сменить, удалить)");
         println!("  [3]  Чекер прокси и проверка доступа ко всем сервисам Google");
         println!("  \x1b[91m[4]\x1b[0m  Полный откат и глубокая очистка следов прошлых обходчиков");
-        println!("  [5]  Сохранить отчёт диагностики в файл");
+        println!("  [5]  Диагностика для ИИ (OpenCode / Kimi / ChatGPT) и отчёт в файл");
         println!("\n  [0]  Выход\n");
 
         match prompt("Выберите действие [0-5]: ").trim() {
